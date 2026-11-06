@@ -4,7 +4,7 @@ Criador de anúncios Shopee  -  serviço SEPARADO do painel agente-shopee.
 
 Fluxo:
   1. Analisar: compara os anúncios ativos do Mercado Livre (conta Duplo Giro) com os SKUs da Shopee.
-  2. Para cada SKU que falta, busca custo/peso/medidas no Bling da irmã e calcula o preço.
+  2. Para cada SKU que falta, busca custo/peso/medidas no Bling da M3 e calcula o preço.
   3. Você marca os itens e envia de 50 em 50 (fotos e descrição vêm do Mercado Livre).
 
 Modo simulação (DRY_RUN=1, padrão): não cria nada na Shopee, só mostra o que seria enviado.
@@ -34,7 +34,7 @@ SHOPEE_KEY = os.environ.get("SHOPEE_PARTNER_KEY", "")
 ML_ID = os.environ.get("ML_CLIENT_ID", "")
 ML_SECRET = os.environ.get("ML_CLIENT_SECRET", "")
 
-BLING_ID = os.environ.get("BLING_CLIENT_ID", "")      # app criado no Bling da IRMÃ
+BLING_ID = os.environ.get("BLING_CLIENT_ID", "")      # app criado no Bling da M3
 BLING_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -420,7 +420,7 @@ def ml_items(prefixos, log):
 
 
 # ----------------------------------------------------------------------------
-# Bling da irmã (custo, peso e medidas)
+# Bling da M3 (custo, peso e medidas)
 # ----------------------------------------------------------------------------
 def bl_auth_url():
     return "https://www.bling.com.br/Api/v3/oauth/authorize?" + urlencode(
@@ -444,7 +444,7 @@ def bl_exchange(code):
 def bl_token():
     t = kv_get("bling_tok")
     if not t:
-        raise RuntimeError("Bling da irmã não conectado")
+        raise RuntimeError("Bling M3 não conectado")
     if t["expires_at"] - time.time() < 300:
         bl_post_token({"grant_type": "refresh_token", "refresh_token": t["refresh_token"]})
         t = kv_get("bling_tok")
@@ -465,7 +465,7 @@ def bl_get(path, params=None):
 
 
 def bling_dados(sku):
-    """Custo (fornecedor.precoCusto), peso e medidas do produto no Bling da irmã."""
+    """Custo (fornecedor.precoCusto), peso e medidas do produto no Bling da M3."""
     code, r = bl_get("/produtos", {"codigos[]": sku})
     if code != 200 or not r.get("data"):
         return None
@@ -518,7 +518,7 @@ def set_cand(sku, data, status, msg=""):
 def aplica_regras(d, s):
     """Define situação e preço do candidato."""
     if not d.get("custo"):
-        return "sem_custo", "sem custo no Bling da irmã"
+        return "sem_custo", "sem custo no Bling da M3"
     if not d.get("fotos"):
         return "sem_foto", "anúncio do ML sem fotos"
     if d["qtd"] <= 0 and not s["criar_sem_estoque"]:
@@ -667,7 +667,10 @@ def connect(svc):
     return redirect(url)
 
 
+# O Bling devolve para /bling/callback (endereço cadastrado no app da M3);
+# o ML e a Shopee usam /callback/<svc>. As duas rotas caem na mesma função.
 @app.route("/callback/<svc>")
+@app.route("/bling/callback", defaults={"svc": "bling"})
 def callback(svc):
     try:
         code = request.args.get("code")
@@ -822,7 +825,7 @@ let S=null,sel=new Set();
 const $=id=>document.getElementById(id);
 const brl=v=>v==null?'-':'R$ '+Number(v).toFixed(2).replace('.',',');
 const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const NOMES={shopee:'Shopee',ml:'Mercado Livre (Duplo Giro)',bling:'Bling da irmã'};
+const NOMES={shopee:'Shopee',ml:'Mercado Livre (Duplo Giro)',bling:'Bling M3'};
 const SIT={pendente:['Pronto','ok'],bloqueado:['Bloqueado','warn'],sem_custo:['Sem custo','bad'],sem_foto:['Sem foto','bad'],sem_estoque:['Sem estoque','warn'],simulado:['Simulado','warn'],criado:['Criado','ok'],erro:['Erro','bad'],erro_preco:['Erro de preço','bad']};
 async function load(){const r=await fetch('/api/state');S=await r.json();draw();}
 function draw(){
