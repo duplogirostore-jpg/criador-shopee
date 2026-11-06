@@ -835,7 +835,7 @@ function draw(){
  const j=S.job;$('jobtag').textContent=j.running?(j.kind==='analisar'?'Analisando...':'Enviando...'):'Parado';
  $('prog').style.width=(j.total?Math.round(j.done/j.total*100):0)+'%';$('log').textContent=j.log.join('\n');$('log').scrollTop=1e9;
  $('bAn').disabled=j.running;
- const fl=$('filtro').value,const all=S.cands.filter(c=>!fl||c.status===fl),rows=all.slice(0,500);
+ const fl=$('filtro').value,all=S.cands.filter(c=>!fl||c.status===fl),rows=all.slice(0,500);
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
  $('tb').innerHTML=rows.length?rows.map(c=>{const s=SIT[c.status]||[c.status,''];const can=c.status==='pendente'||c.status==='simulado'||c.status==='erro'||c.status==='bloqueado';
   return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${s[1]}">${s[0]}</span>${c.msg?`<div style="color:var(--mut);font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="9" style="color:var(--mut);padding:18px">Nada por aqui. Clique em "Analisar ML x Shopee" para buscar os anúncios que faltam.</td></tr>';
