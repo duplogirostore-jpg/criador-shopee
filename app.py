@@ -464,20 +464,43 @@ def bl_get(path, params=None):
     raise RuntimeError("Bling limitou as consultas (429)")
 
 
-def bling_dados(sku):
-    """Custo (fornecedor.precoCusto), peso e medidas do produto no Bling da M3."""
-    code, r = bl_get("/produtos", {"codigos[]": sku})
-    if code != 200 or not r.get("data"):
-        return None
-    pid = r["data"][0]["id"]
-    code, r = bl_get(f"/produtos/{pid}")
+BL_ULT_ERRO = {"msg": ""}
+
+
+def bling_empresa():
+    """Nome da conta Bling conectada (para conferir se é a M3)."""
+    code, r = bl_get("/empresas/me/dados-basicos")
     if code != 200:
-        return None
+        return f"não foi possível ler a empresa (resposta {code})"
     d = r.get("data") or {}
-    custo = (d.get("fornecedor") or {}).get("precoCusto") or d.get("precoCusto") or 0
-    dim = d.get("dimensoes") or {}
-    return {"custo": float(custo or 0), "peso": float(d.get("pesoBruto") or 0),
-            "dim": [dim.get("profundidade") or 0, dim.get("largura") or 0, dim.get("altura") or 0]}
+    return d.get("nome") or d.get("razaoSocial") or d.get("fantasia") or str(d)[:120]
+
+
+def bling_dados(sku):
+    """Custo, peso e medidas do produto no Bling da M3.
+    Custo: fornecedor.precoCusto do produto; se faltar, usa o precoCusto da listagem."""
+    code, r = bl_get("/produtos", {"codigos[]": sku})
+    if code != 200:
+        BL_ULT_ERRO["msg"] = f"Bling /produtos respondeu {code}: {str(r)[:200]}"
+        return None
+    if not r.get("data"):
+        BL_ULT_ERRO["msg"] = f"SKU {sku} não encontrado no Bling conectado"
+        return None
+    item = r["data"][0]
+    custo = float(item.get("precoCusto") or 0)
+    peso, dim = 0.0, [0, 0, 0]
+    code, r2 = bl_get(f"/produtos/{item['id']}")
+    if code == 200:
+        d = r2.get("data") or {}
+        custo = float((d.get("fornecedor") or {}).get("precoCusto") or d.get("precoCusto") or custo or 0)
+        dm = d.get("dimensoes") or {}
+        peso = float(d.get("pesoBruto") or 0)
+        dim = [dm.get("profundidade") or 0, dm.get("largura") or 0, dm.get("altura") or 0]
+    else:
+        BL_ULT_ERRO["msg"] = f"Bling /produtos/{item['id']} respondeu {code}: {str(r2)[:200]}"
+    if not custo:
+        BL_ULT_ERRO["msg"] = f"SKU {sku} achado no Bling, mas sem preço de custo"
+    return {"custo": custo, "peso": peso, "dim": dim}
 
 
 # ----------------------------------------------------------------------------
@@ -541,14 +564,23 @@ def job_analisar():
     jlog(f"{len(faltam)} SKUs estão no ML e não estão na Shopee")
     antigos = {r[0]: r[1] for r in run("SELECT sku, status FROM cria_cand", (), True)}
     JOB["total"] = len(faltam)
+    try:
+        jlog(f"Bling conectado: {bling_empresa()}")
+    except Exception as e:
+        jlog(f"Bling: não consegui identificar a conta ({e})")
+    falhas = 0
     for sku_n, d in faltam.items():
         if antigos.get(d["sku"]) == "criado":
             continue
+        BL_ULT_ERRO["msg"] = ""
         try:
             b = bling_dados(d["sku"])
         except Exception as e:
-            jlog(f"Bling: {e}")
+            BL_ULT_ERRO["msg"] = str(e)
             b = None
+        if (not b or not b.get("custo")) and falhas < 5:
+            jlog(f"Bling: {BL_ULT_ERRO['msg'] or 'sem custo'}")
+            falhas += 1
         if b:
             d.update(custo=b["custo"], peso=b["peso"], dim=b["dim"])
         st, msg = aplica_regras(d, s)
@@ -728,6 +760,22 @@ def api_settings():
             ns, msg = aplica_regras(d, s)
             set_cand(sku, d, ns, msg)
     return jsonify({"ok": True})
+
+
+@app.route("/api/bling-teste")
+def api_bling_teste():
+    """Diagnóstico: /api/bling-teste?sku=SM101001 mostra a conta conectada e o que o Bling devolve."""
+    sku = request.args.get("sku", "").strip()
+    out = {}
+    try:
+        out["conta"] = bling_empresa()
+        if sku:
+            BL_ULT_ERRO["msg"] = ""
+            out["dados"] = bling_dados(sku)
+            out["aviso"] = BL_ULT_ERRO["msg"]
+    except Exception as e:
+        out["erro"] = str(e)
+    return jsonify(out)
 
 
 @app.route("/api/analyze", methods=["POST"])
