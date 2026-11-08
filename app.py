@@ -429,7 +429,7 @@ def bl_auth_url():
 
 def bl_post_token(data):
     basic = base64.b64encode(f"{BLING_ID}:{BLING_SECRET}".encode()).decode()
-    r = requests.post("https://www.bling.com.br/Api/v3/oauth/token", data=data, timeout=30,
+    r = requests.post("https://api.bling.com.br/Api/v3/oauth/token", data=data, timeout=30,
                       headers={"Authorization": "Basic " + basic, "Accept": "1.0"}).json()
     if "access_token" not in r:
         raise RuntimeError(f"Bling: {r.get('error', {}).get('description') or r}")
@@ -455,7 +455,7 @@ def bl_get(path, params=None):
     t = bl_token()
     for tentativa in range(5):
         time.sleep(0.4)   # limite do Bling: 3 consultas por segundo
-        r = requests.get("https://www.bling.com.br/Api/v3" + path, params=params, timeout=60,
+        r = requests.get("https://api.bling.com.br/Api/v3" + path, params=params, timeout=60,
                          headers={"Authorization": "Bearer " + t["access_token"]})
         if r.status_code == 429:
             time.sleep(2 + tentativa)
