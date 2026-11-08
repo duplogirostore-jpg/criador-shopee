@@ -54,6 +54,7 @@ DEFAULTS = {
     "peso_padrao": 0.3,          # kg, se o Bling não tiver
     "dim_padrao": [20, 15, 10],  # comprimento, largura, altura (cm)
     "criar_sem_estoque": False,
+    "alerta_acima_ml": 15.0,     # % acima do preço do ML que acende o alerta
     "atributos": {"bluetooth": "Não"},   # nome do atributo obrigatório -> valor
 }
 
@@ -267,10 +268,36 @@ def shopee_skus():
 _attr_cache, _logi_cache = {}, {}
 
 
+def _nm(x):
+    """Nome de atributo/valor: aceita name, display_name ou multi_lang."""
+    if not isinstance(x, dict):
+        return ""
+    n = x.get("display_name") or x.get("name") or x.get("display_attribute_name") or x.get("original_name") or ""
+    if n:
+        return str(n)
+    for ml in x.get("multi_lang") or []:
+        if ml.get("value"):
+            return str(ml["value"])
+    return ""
+
+
 def sp_attributes(cat):
+    """Atributos da categoria (get_attribute_tree), no formato que resolve_attrs espera."""
     if cat not in _attr_cache:
-        r = sp("/api/v2/product/get_attributes", params={"category_id": cat})
-        _attr_cache[cat] = (r.get("response") or {}).get("attribute_list", [])
+        r = sp("/api/v2/product/get_attribute_tree", params={"category_id_list": str(cat)})
+        resp = r.get("response") or {}
+        trees = []
+        for it in resp.get("list") or []:
+            trees += it.get("attribute_tree") or []
+        trees += resp.get("attribute_tree") or []
+        out = []
+        for a in trees:
+            vals = [{"value_id": v.get("value_id"), "display_value_name": _nm(v), "original_value_name": _nm(v)}
+                    for v in (a.get("attribute_value_list") or []) if v.get("value_id") is not None]
+            out.append({"attribute_id": a.get("attribute_id"),
+                        "is_mandatory": bool(a.get("mandatory", a.get("is_mandatory"))),
+                        "display_attribute_name": _nm(a), "attribute_value_list": vals})
+        _attr_cache[cat] = out
     return _attr_cache[cat]
 
 
@@ -397,7 +424,7 @@ def ml_items(prefixos, log):
     out, sem_sku = {}, 0
     for i in range(0, len(ids), 20):
         code, r = ml_get("/items", {"ids": ",".join(ids[i:i + 20]),
-                                   "attributes": "id,title,seller_custom_field,pictures,attributes,available_quantity,permalink,status"})
+                                   "attributes": "id,title,seller_custom_field,pictures,attributes,available_quantity,permalink,status,price"})
         if code != 200:
             continue
         for e in r:
@@ -412,7 +439,8 @@ def ml_items(prefixos, log):
                 continue
             fotos = [p.get("secure_url") or p.get("url") for p in b.get("pictures", []) if p.get("secure_url") or p.get("url")]
             d = {"sku": str(sku).strip(), "ml_id": b.get("id"), "titulo": b.get("title", ""),
-                 "qtd": int(b.get("available_quantity") or 0), "fotos": fotos, "link": b.get("permalink")}
+                 "qtd": int(b.get("available_quantity") or 0), "fotos": fotos, "link": b.get("permalink"),
+                 "preco_ml": float(b.get("price") or 0)}
             if k not in out or len(fotos) > len(out[k]["fotos"]):
                 out[k] = d
     log(f"ML: {len(out)} SKUs com o prefixo ({sem_sku} anúncios sem SKU ignorados)")
@@ -551,6 +579,8 @@ def aplica_regras(d, s):
         return "erro_preco", "não foi possível calcular o preço"
     d["preco"] = p
     d["calc"] = breakdown(p, d["custo"], s)
+    pm = d.get("preco_ml") or 0
+    d["dif_ml"] = round((p / pm - 1) * 100, 1) if pm else None
     return "pendente", ""
 
 
@@ -729,7 +759,8 @@ def api_state():
         d = json.loads(data)
         cands.append({"sku": sku, "titulo": d.get("titulo"), "custo": d.get("custo"), "preco": d.get("preco"),
                       "lucro": (d.get("calc") or {}).get("lucro"), "qtd": d.get("qtd"),
-                      "fotos": len(d.get("fotos") or []), "status": st, "msg": msg, "link": d.get("link")})
+                      "fotos": len(d.get("fotos") or []), "status": st, "msg": msg, "link": d.get("link"),
+                      "preco_ml": d.get("preco_ml"), "dif": d.get("dif_ml")})
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
@@ -741,7 +772,7 @@ def api_settings():
     j = request.get_json(force=True)
     s = settings()
     try:
-        for k in ("lucro", "promo", "imposto", "piso", "peso_padrao"):
+        for k in ("lucro", "promo", "imposto", "piso", "peso_padrao", "alerta_acima_ml"):
             s[k] = float(str(j.get(k, s[k])).replace(",", "."))
         s["prefixos"] = str(j.get("prefixos", s["prefixos"]))
         s["categoria_id"] = str(j.get("categoria_id", s["categoria_id"])).strip()
@@ -845,6 +876,7 @@ details summary{cursor:pointer;font-weight:600}
 <div><label>Promoção semanal (%)</label><input type="number" step="0.1" id="promo"></div>
 <div><label>Imposto, pior cenário (%)</label><input type="number" step="0.1" id="imposto"></div>
 <div><label>Preço mínimo anunciado (R$)</label><input type="number" step="0.01" id="piso"></div>
+<div><label>Alerta: % acima do preço do ML</label><input type="number" step="1" id="alerta_acima_ml"></div>
 <div><label>Prefixos de SKU (vírgula)</label><input type="text" id="prefixos"></div>
 <div><label>ID da categoria Shopee (vazio = automática)</label><input type="text" id="categoria_id"></div>
 <div><label>Peso padrão (kg)</label><input type="number" step="0.01" id="peso_padrao"></div>
@@ -863,14 +895,15 @@ details summary{cursor:pointer;font-weight:600}
 <section><h2>2. Escolher e enviar</h2>
 <div class="row" style="margin-bottom:10px">
 <select id="filtro" onchange="draw()" style="font:inherit;padding:7px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">
-<option value="pendente">Prontos para enviar</option><option value="bloqueado">Bloqueados</option><option value="sem_custo">Sem custo</option><option value="sem_foto">Sem foto</option><option value="sem_estoque">Sem estoque</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="erro">Com erro</option><option value="">Todos</option></select>
+<option value="pendente">Prontos para enviar</option><option value="acima">Acima do ML</option><option value="bloqueado">Bloqueados</option><option value="sem_custo">Sem custo</option><option value="sem_foto">Sem foto</option><option value="sem_estoque">Sem estoque</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="erro">Com erro</option><option value="">Todos</option></select>
 <button onclick="sel50()">Marcar os próximos 50</button><button onclick="selNone()">Limpar seleção</button><span class="tag" id="cont"></span></div>
-<div class="tw"><table><thead><tr><th></th><th>SKU</th><th>Título</th><th class="n">Custo</th><th class="n">Preço</th><th class="n">Lucro</th><th class="n">Est.</th><th class="n">Fotos</th><th>Situação</th></tr></thead><tbody id="tb"></tbody></table></div>
+<div class="tw"><table><thead><tr><th></th><th>SKU</th><th>Título</th><th class="n">Custo</th><th class="n">Preço</th><th class="n">Preço ML</th><th class="n">vs ML</th><th class="n">Lucro</th><th class="n">Est.</th><th class="n">Fotos</th><th>Situação</th></tr></thead><tbody id="tb"></tbody></table></div>
 </section></main>
 <div class="bottom"><div class="in"><button class="pri" id="bEnv" onclick="enviar()" disabled>Enviar selecionados</button><span id="selinfo" class="tag">0 selecionados</span><span style="color:var(--mut);font-size:13px">Máximo de 50 por envio.</span></div></div>
 <script>
 let S=null,sel=new Set();
 const $=id=>document.getElementById(id);
+const acima=c=>c.dif!=null&&c.dif>Number((S&&S.settings.alerta_acima_ml)||0);
 const brl=v=>v==null?'-':'R$ '+Number(v).toFixed(2).replace('.',',');
 const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const NOMES={shopee:'Shopee',ml:'Mercado Livre (Duplo Giro)',bling:'Bling M3'};
@@ -882,19 +915,19 @@ function draw(){
  $('conns').innerHTML=Object.keys(NOMES).map(k=>{const on=S.conn[k],cfg=S.cfg_ok[k];
   return `<div class="conn"><span>${NOMES[k]}</span><span class="row"><span class="tag ${on?'ok':'bad'}">${on?'Conectado':(cfg?'Não conectado':'Faltam variáveis no Render')}</span>${cfg?`<a class="btn" href="/connect/${k}">${on?'Reconectar':'Conectar'}</a>`:''}</span></div>`}).join('');
  const st=S.settings,f=(id,v)=>{const e=$(id);if(document.activeElement!==e){if(e.type==='checkbox')e.checked=!!v;else e.value=v}};
- f('lucro',st.lucro);f('promo',st.promo);f('imposto',st.imposto);f('piso',st.piso);f('prefixos',st.prefixos);f('categoria_id',st.categoria_id);f('peso_padrao',st.peso_padrao);f('dim_padrao',st.dim_padrao.join(' x '));f('atributos',JSON.stringify(st.atributos));f('criar_sem_estoque',st.criar_sem_estoque);
+ f('lucro',st.lucro);f('promo',st.promo);f('imposto',st.imposto);f('piso',st.piso);f('alerta_acima_ml',st.alerta_acima_ml);f('prefixos',st.prefixos);f('categoria_id',st.categoria_id);f('peso_padrao',st.peso_padrao);f('dim_padrao',st.dim_padrao.join(' x '));f('atributos',JSON.stringify(st.atributos));f('criar_sem_estoque',st.criar_sem_estoque);
  const j=S.job;$('jobtag').textContent=j.running?(j.kind==='analisar'?'Analisando...':'Enviando...'):'Parado';
  $('prog').style.width=(j.total?Math.round(j.done/j.total*100):0)+'%';$('log').textContent=j.log.join('\n');$('log').scrollTop=1e9;
  $('bAn').disabled=j.running;
- const fl=$('filtro').value,all=S.cands.filter(c=>!fl||c.status===fl),rows=all.slice(0,500);
+ const fl=$('filtro').value,all=S.cands.filter(c=>fl==='acima'?acima(c):(!fl||c.status===fl)),rows=all.slice(0,500);
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
  $('tb').innerHTML=rows.length?rows.map(c=>{const s=SIT[c.status]||[c.status,''];const can=c.status==='pendente'||c.status==='simulado'||c.status==='erro'||c.status==='bloqueado';
-  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${s[1]}">${s[0]}</span>${c.msg?`<div style="color:var(--mut);font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="9" style="color:var(--mut);padding:18px">Nada por aqui. Clique em "Analisar ML x Shopee" para buscar os anúncios que faltam.</td></tr>';
+  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${s[1]}">${s[0]}</span>${c.msg?`<div style="color:var(--mut);font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" style="color:var(--mut);padding:18px">Nada por aqui. Clique em "Analisar ML x Shopee" para buscar os anúncios que faltam.</td></tr>';
  upd();
 }
 function upd(){$('selinfo').textContent=sel.size+' selecionados';$('bEnv').disabled=!sel.size||(S&&S.job.running)}
 function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_lote+' por envio.');draw();return}sel.add(s)}else sel.delete(s);upd()}
-function sel50(){sel.clear();S.cands.filter(c=>c.status==='pendente').slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
+function sel50(){sel.clear();S.cands.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)alert(j.erro||'Erro');return j}
 async function analisar(){await post('/api/analyze');load()}
@@ -904,7 +937,7 @@ async function enviar(){
  const j=await post('/api/send',{skus:[...sel]});if(j.ok){sel.clear()}load()}
 async function salvar(){
  const dim=$('dim_padrao').value.split(/[x,;\s]+/).filter(Boolean).map(Number);
- const j=await post('/api/settings',{lucro:$('lucro').value,promo:$('promo').value,imposto:$('imposto').value,piso:$('piso').value,prefixos:$('prefixos').value,categoria_id:$('categoria_id').value,peso_padrao:$('peso_padrao').value,dim_padrao:dim,atributos:$('atributos').value,criar_sem_estoque:$('criar_sem_estoque').checked});
+ const j=await post('/api/settings',{lucro:$('lucro').value,promo:$('promo').value,imposto:$('imposto').value,piso:$('piso').value,alerta_acima_ml:$('alerta_acima_ml').value,prefixos:$('prefixos').value,categoria_id:$('categoria_id').value,peso_padrao:$('peso_padrao').value,dim_padrao:dim,atributos:$('atributos').value,criar_sem_estoque:$('criar_sem_estoque').checked});
  if(j.ok)load()}
 load();setInterval(load,4000);
 </script></body></html>"""
