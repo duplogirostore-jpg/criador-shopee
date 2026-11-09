@@ -309,6 +309,19 @@ def sp_logistics():
     return _logi_cache["l"]
 
 
+_cat_cache = {}
+
+
+def sp_categories():
+    if "c" not in _cat_cache:
+        try:
+            r = sp("/api/v2/product/get_category", params={"language": "pt-BR"})
+        except Exception:
+            r = sp("/api/v2/product/get_category")
+        _cat_cache["c"] = (r.get("response") or {}).get("category_list", [])
+    return _cat_cache["c"]
+
+
 def sp_category(title, s):
     if str(s.get("categoria_id") or "").strip():
         return int(s["categoria_id"])
@@ -833,6 +846,35 @@ def api_bling_teste():
     return jsonify(out)
 
 
+@app.route("/api/categorias")
+def api_categorias():
+    """Busca categorias finais da Shopee pelo texto: /api/categorias?q=moto injecao"""
+    try:
+        q = [w for w in norm(request.args.get("q", "")).split() if w]
+        cats = sp_categories()
+        by = {c["category_id"]: c for c in cats}
+
+        def nome(c):
+            return c.get("display_category_name") or c.get("original_category_name") or str(c["category_id"])
+
+        def caminho(c):
+            p = []
+            while c:
+                p.append(nome(c))
+                c = by.get(c.get("parent_category_id"))
+            return " > ".join(reversed(p))
+        out = []
+        for c in cats:
+            if c.get("has_children"):
+                continue
+            cam = caminho(c)
+            if all(w in norm(cam) for w in q):
+                out.append({"id": c["category_id"], "caminho": cam})
+        return jsonify(out[:60])
+    except Exception as e:
+        return jsonify({"erro": str(e)})
+
+
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
     if not start_job("analisar", job_analisar):
@@ -937,6 +979,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div><label>Peso padrão (kg)</label><input type="number" step="0.01" id="peso_padrao"></div>
 <div><label>Medidas padrão C x L x A (cm)</label><input type="text" id="dim_padrao"></div>
 </div>
+<div style="margin-top:12px"><label>Buscar categoria na Shopee (ex.: moto injeção)</label><div class="row"><input type="text" id="qcat" style="flex:1" placeholder="moto injeção"><button onclick="buscaCat()">Buscar</button></div><div id="rcat" class="mut" style="margin-top:8px"></div></div>
 <div style="margin-top:12px"><label>Atributos obrigatórios da Shopee (JSON: nome e valor; use {sku} para o código do produto)</label><textarea id="atributos" rows="3"></textarea></div>
 <div class="row" style="margin-top:12px"><label style="display:flex;gap:8px;align-items:center;margin:0"><input type="checkbox" id="criar_sem_estoque"> Criar também itens sem estoque no ML</label><button class="pri" onclick="salvar()">Salvar e recalcular preços</button></div>
 </div></section>
@@ -990,6 +1033,12 @@ async function enviar(){
  const n=sel.size;if(!n)return;
  if(!S.dry&&!confirm('Criar '+n+' anúncios na Shopee agora?'))return;
  const j=await post('/api/send',{skus:[...sel]});if(j.ok){sel.clear()}load()}
+async function buscaCat(){
+ $('rcat').textContent='Buscando...';
+ try{const r=await fetch('/api/categorias?q='+encodeURIComponent($('qcat').value));const j=await r.json();
+ $('rcat').innerHTML=Array.isArray(j)?(j.length?j.map(x=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)"><button onclick="usaCat(${x.id})" style="padding:3px 10px;margin-right:8px">Usar</button><b>${x.id}</b> ${esc(x.caminho)}</div>`).join(''):'Nenhuma categoria encontrada.'):esc(j.erro||'Erro');
+ }catch(e){$('rcat').textContent='Erro: '+e}}
+async function usaCat(id){await post('/api/settings',{categoria_id:String(id)});$('rcat').textContent='Categoria '+id+' salva para todos os próximos envios.';load()}
 async function salvar(){
  const dim=$('dim_padrao').value.split(/[x,;\s]+/).filter(Boolean).map(Number);
  const j=await post('/api/settings',{lucro:$('lucro').value,promo:$('promo').value,imposto:$('imposto').value,piso:$('piso').value,alerta_acima_ml:$('alerta_acima_ml').value,prefixos:$('prefixos').value,categoria_id:$('categoria_id').value,peso_padrao:$('peso_padrao').value,dim_padrao:dim,atributos:$('atributos').value,criar_sem_estoque:$('criar_sem_estoque').checked});
