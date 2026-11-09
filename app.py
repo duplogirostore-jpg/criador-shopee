@@ -322,7 +322,7 @@ def sp_category(title, s):
 NEG = {"nao", "no", "none", "sem", "nenhum", "nao possui", "nao tem"}
 
 
-def resolve_attrs(cat, s):
+def resolve_attrs(cat, s, sku=""):
     """Preenche os atributos obrigatórios (ex.: Bluetooth). Retorna (lista, problemas)."""
     ov = {norm(k): v for k, v in (s.get("atributos") or {}).items()}
     out, problems = [], []
@@ -334,6 +334,10 @@ def resolve_attrs(cat, s):
         want = ov.get(nn)
         if want is None:
             want = next((v for k, v in ov.items() if k and k in nn), None)
+        if want is None and any(t in nn for t in ("part number", "numero da peca", "numero de peca", "codigo da peca")):
+            want = sku
+        if want is not None:
+            want = str(want).replace("{sku}", sku)
         vals = a.get("attribute_value_list") or []
         if want is None:
             op = ", ".join((v.get("display_value_name") or v.get("original_value_name") or "?") for v in vals[:12])
@@ -534,28 +538,40 @@ def bling_dados(sku):
 # ----------------------------------------------------------------------------
 # Tarefas em segundo plano
 # ----------------------------------------------------------------------------
-JOB = {"running": False, "kind": "", "msg": "", "done": 0, "total": 0, "log": []}
+def _new_job():
+    return {"running": False, "kind": "", "msg": "", "done": 0, "total": 0, "log": []}
+
+
+JOBS = {"analisar": _new_job(), "enviar": _new_job()}
 JOB_LOCK = threading.Lock()
+_tl = threading.local()
+
+
+def J():
+    return JOBS[getattr(_tl, "kind", "analisar")]
 
 
 def jlog(m):
-    JOB["msg"] = m
-    JOB["log"] = (JOB["log"] + [f"{datetime.now().strftime('%H:%M:%S')} {m}"])[-60:]
+    j = J()
+    j["msg"] = m
+    j["log"] = (j["log"] + [f"{datetime.now().strftime('%H:%M:%S')} {m}"])[-60:]
 
 
 def start_job(kind, fn, *a):
     with JOB_LOCK:
-        if JOB["running"]:
+        j = JOBS[kind]
+        if j["running"]:
             return False
-        JOB.update(running=True, kind=kind, msg="Iniciando...", done=0, total=0, log=[])
+        j.update(running=True, kind=kind, msg="Iniciando...", done=0, total=0, log=[])
 
     def wrap():
+        _tl.kind = kind
         try:
             fn(*a)
         except Exception as e:
             jlog(f"ERRO: {e}")
         finally:
-            JOB["running"] = False
+            j["running"] = False
     threading.Thread(target=wrap, daemon=True).start()
     return True
 
@@ -593,7 +609,7 @@ def job_analisar():
     faltam = {k: v for k, v in ml.items() if k not in shp}
     jlog(f"{len(faltam)} SKUs estão no ML e não estão na Shopee")
     antigos = {r[0]: r[1] for r in run("SELECT sku, status FROM cria_cand", (), True)}
-    JOB["total"] = len(faltam)
+    J()["total"] = len(faltam)
     try:
         jlog(f"Bling conectado: {bling_empresa()}")
     except Exception as e:
@@ -613,17 +629,20 @@ def job_analisar():
             falhas += 1
         if b:
             d.update(custo=b["custo"], peso=b["peso"], dim=b["dim"])
+        atual = run("SELECT status FROM cria_cand WHERE sku=?", (d["sku"],), True)
+        if atual and atual[0][0] == "criado":
+            continue
         st, msg = aplica_regras(d, s)
         set_cand(d["sku"], d, st, msg)
-        JOB["done"] += 1
-        if JOB["done"] % 10 == 0:
-            jlog(f"Preparados {JOB['done']} de {JOB['total']}")
+        J()["done"] += 1
+        if J()["done"] % 10 == 0:
+            jlog(f"Preparados {J()['done']} de {J()['total']}")
     # remove quem já existe na Shopee agora ou não está mais ativo no ML
     atuais = {d["sku"] for d in faltam.values()}
     for sku, st_antigo in antigos.items():
         if st_antigo != "criado" and sku not in atuais:
             run("DELETE FROM cria_cand WHERE sku=?", (sku,))
-    jlog(f"Análise concluída: {JOB['done']} itens preparados")
+    jlog(f"Análise concluída: {J()['done']} itens preparados")
 
 
 def dry_run_on():
@@ -640,7 +659,7 @@ def enviar_um(sku, s):
         set_cand(sku, d, st, msg)
         return st, msg
     cat = sp_category(d["titulo"], s)
-    attrs, problemas = resolve_attrs(cat, s)
+    attrs, problemas = resolve_attrs(cat, s, d["sku"])
     if problemas:
         msg = "; ".join(problemas)
         set_cand(sku, d, "bloqueado", msg)
@@ -682,7 +701,7 @@ def enviar_um(sku, s):
 
 def job_enviar(skus):
     s = settings()
-    JOB["total"] = len(skus)
+    J()["total"] = len(skus)
     res = {}
     for sku in skus:
         try:
@@ -693,7 +712,7 @@ def job_enviar(skus):
             if row:
                 set_cand(sku, json.loads(row[0][0]), "erro", msg)
         res[st] = res.get(st, 0) + 1
-        JOB["done"] += 1
+        J()["done"] += 1
         jlog(f"{sku}: {st} {msg}"[:200])
         time.sleep(0.5)
     jlog("Lote concluído: " + ", ".join(f"{v} {k}" for k, v in res.items()))
@@ -764,7 +783,7 @@ def api_state():
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
-        "settings": settings(), "dry": dry_run_on(), "job": JOB, "cands": cands, "max_lote": MAX_LOTE})
+        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "cands": cands, "max_lote": MAX_LOTE})
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -830,48 +849,78 @@ PAGE = r"""<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Criador de anúncios Shopee</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#f4f5f3;--card:#fff;--ink:#1d2321;--mut:#65706b;--line:#dde2de;--acc:#0e6b5c;--acc-ink:#fff;--warn:#9a5b00;--bad:#b3261e;--ok:#17703a}
-@media (prefers-color-scheme:dark){:root{--bg:#141817;--card:#1c2220;--ink:#e8ece9;--mut:#9aa6a0;--line:#2f3835;--acc:#3fb59f;--acc-ink:#07201b;--warn:#e0a24a;--bad:#ff8a80;--ok:#6fd49a}}
+:root{--bg:#f2f4fa;--panel:#fff;--soft:#eceff8;--ink:#131a2c;--mut:#667290;--line:#dde2ef;--acc:#4d59f5;--acc2:#9a5cff;--on:#fff;--ok:#0b9a68;--warn:#b0731a;--bad:#d63d4b}
+@media(prefers-color-scheme:dark){:root{--bg:#0b0f1a;--panel:#131928;--soft:#1a2236;--ink:#e8ecf6;--mut:#8e9ab6;--line:#252e48;--acc:#7c87ff;--acc2:#b08cff;--on:#0b0f1a;--ok:#3fd49b;--warn:#f0b955;--bad:#ff7a85}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:1100px;margin:0 auto;padding:18px 14px 80px}
-h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:0 0 10px}
-.sub{color:var(--mut);margin:0 0 16px}
-section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1,h2,.num{font-family:Sora,system-ui,sans-serif;letter-spacing:-.01em}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.top{max-width:1180px;margin:0 auto;padding:12px 16px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.brand{font:700 18px Sora,system-ui;display:flex;align-items:center;gap:10px}
+.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--acc),var(--acc2))}
+nav{display:flex;gap:4px;background:var(--soft);padding:4px;border-radius:12px}
+nav button{border:0;background:none;color:var(--mut);font:600 14px inherit;padding:7px 14px;border-radius:9px;cursor:pointer}
+nav button.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 3px rgba(20,30,60,.15)}
+.sp{flex:1}
+.dots{display:flex;gap:10px;font-size:13px;color:var(--mut)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--bad);margin-right:5px}.dot.ok{background:var(--ok)}
+.mode{font-size:12px;font-weight:600;padding:4px 10px;border-radius:99px}
+.mode.sim{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}.mode.live{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)}
+main{max-width:1180px;margin:0 auto;padding:20px 16px 110px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:16px}
+h2{font-size:16px;margin:0 0 12px}
+button,.btn{font:inherit;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;padding:9px 14px;cursor:pointer;text-decoration:none;display:inline-block}
+button.pri{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border:0}
+button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
+.tile{text-align:left;border-radius:14px;padding:14px 16px;border:1px solid var(--line);background:var(--panel)}
+.tile.on{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+.tile .num{display:block;font-size:30px;font-weight:700;line-height:1.1}.tile span:last-child{color:var(--mut);font-size:13px;font-weight:500}
+.tile.ok .num{color:var(--ok)}.tile.bad .num{color:var(--bad)}.tile.warn .num{color:var(--warn)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-button,.btn{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:6px;padding:8px 12px;cursor:pointer;text-decoration:none;display:inline-block}
-button.pri{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);font-weight:600}
-button:disabled{opacity:.5;cursor:not-allowed}
-button:focus-visible,input:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
-.conn{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)}
-.conn:last-child{border:0}
-.tag{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
-.tag.ok{color:var(--ok);border-color:var(--ok)}.tag.bad{color:var(--bad);border-color:var(--bad)}.tag.warn{color:var(--warn);border-color:var(--warn)}
-label{display:block;font-size:13px;color:var(--mut);margin-bottom:3px}
-input[type=text],input[type=number],textarea{width:100%;font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:8px 0}
-.bar i{display:block;height:100%;background:var(--acc);width:0}
-#log{font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--mut);max-height:130px;overflow:auto;white-space:pre-wrap}
-.tw{overflow-x:auto}
-table{border-collapse:collapse;width:100%;min-width:760px}
-th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{font-size:13px;color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--card)}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.sim{background:var(--warn);color:#fff;border-radius:6px;padding:6px 10px;font-size:13px}
-.live{background:var(--bad);color:#fff;border-radius:6px;padding:6px 10px;font-size:13px}
-.bottom{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 14px}
-.bottom .in{max-width:1100px;margin:0 auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-details summary{cursor:pointer;font-weight:600}
-</style></head><body><main>
-<h1>Criador de anúncios Shopee</h1>
-<p class="sub">Compara o Mercado Livre com a Shopee e cria os anúncios que faltam, de 50 em 50.</p>
+.bar{height:6px;background:var(--soft);border-radius:4px;overflow:hidden;margin:12px 0 6px}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .4s}
+.mut{color:var(--mut);font-size:13px}
+#alog,#slog{font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;color:var(--mut);max-height:140px;overflow:auto;white-space:pre-wrap;margin-top:8px}
+.tag{font-size:12px;font-weight:600;padding:2px 9px;border-radius:99px;background:var(--soft);color:var(--mut)}
+.tag.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}.tag.bad{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}.tag.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:900px}
+th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--mut);font-weight:600}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+td a{color:var(--ink)}
+.conn{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:14px 0;border-bottom:1px solid var(--line)}.conn:last-child{border:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+label{display:block;font-size:13px;color:var(--mut);margin-bottom:4px}
+input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)}
+.bottom{position:fixed;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(10px);border-top:1px solid var(--line);padding:12px 16px;z-index:5}
+.bottom .in{max-width:1180px;margin:0 auto;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+[hidden]{display:none!important}
+</style></head><body>
+<header><div class="top">
+<div class="brand"><span class="logo"></span>Criador de anúncios</div>
+<nav><button id="t-anuncios" onclick="go('anuncios')">Anúncios</button><button id="t-conexoes" onclick="go('conexoes')">Conexões</button><button id="t-regras" onclick="go('regras')">Regras de preço</button></nav>
+<span class="sp"></span><div class="dots" id="dots"></div><span id="modo"></span>
+</div></header>
+<main>
+<section id="p-anuncios">
+<div class="tiles" id="tiles"></div>
+<div class="card"><div class="row"><button class="pri" id="bAn" onclick="analisar()">Analisar Mercado Livre e Shopee</button><span id="amsg" class="mut"></span></div>
+<div class="bar"><i id="aprog"></i></div>
+<details><summary class="mut" style="cursor:pointer">Ver detalhes da análise</summary><div id="alog"></div></details></div>
+<div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Anúncios para criar</h2>
+<select id="filtro" onchange="setF(this.value)" style="width:auto"><option value="pendente">Prontos</option><option value="acima">Acima do ML</option><option value="problemas">Com pendência</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="">Todos</option></select>
+<button onclick="sel50()">Marcar 50</button><button onclick="selNone()">Limpar</button><span class="tag" id="cont"></span></div>
+<div class="tw"><table><thead><tr><th></th><th>SKU</th><th>Título</th><th class="n">Custo</th><th class="n">Preço</th><th class="n">Preço ML</th><th class="n">vs ML</th><th class="n">Lucro</th><th class="n">Est.</th><th class="n">Fotos</th><th>Situação</th></tr></thead><tbody id="tb"></tbody></table></div></div>
+</section>
 
-<section><div class="row" style="justify-content:space-between"><h2 style="margin:0">Conexões</h2><span id="modo"></span></div><div id="conns"></div></section>
+<section id="p-conexoes" hidden><div class="card"><h2>Conexões</h2><div id="conns"></div>
+<p class="mut">O Bling usado aqui é o da M3. Para trocar de conta, entre nela em janela anônima e clique em Reconectar.</p></div></section>
 
-<section><details><summary>Regras de preço e configurações</summary>
-<div class="grid" style="margin-top:12px">
+<section id="p-regras" hidden><div class="card"><h2>Regras de preço e envio</h2>
+<div class="grid">
 <div><label>Lucro (% do valor anunciado)</label><input type="number" step="0.1" id="lucro"></div>
 <div><label>Promoção semanal (%)</label><input type="number" step="0.1" id="promo"></div>
 <div><label>Imposto, pior cenário (%)</label><input type="number" step="0.1" id="imposto"></div>
@@ -882,50 +931,50 @@ details summary{cursor:pointer;font-weight:600}
 <div><label>Peso padrão (kg)</label><input type="number" step="0.01" id="peso_padrao"></div>
 <div><label>Medidas padrão C x L x A (cm)</label><input type="text" id="dim_padrao"></div>
 </div>
-<div style="margin-top:10px"><label>Atributos obrigatórios da Shopee (JSON: nome → valor)</label><textarea id="atributos" rows="3"></textarea></div>
-<div class="row" style="margin-top:10px"><label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="criar_sem_estoque"> Criar também itens sem estoque no ML</label>
-<button class="pri" onclick="salvar()">Salvar e recalcular preços</button></div>
-</details></section>
-
-<section><h2>1. Analisar</h2>
-<div class="row"><button class="pri" id="bAn" onclick="analisar()">Analisar ML x Shopee</button>
-<span class="tag" id="jobtag"></span></div>
-<div class="bar"><i id="prog"></i></div><div id="log"></div></section>
-
-<section><h2>2. Escolher e enviar</h2>
-<div class="row" style="margin-bottom:10px">
-<select id="filtro" onchange="draw()" style="font:inherit;padding:7px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">
-<option value="pendente">Prontos para enviar</option><option value="acima">Acima do ML</option><option value="bloqueado">Bloqueados</option><option value="sem_custo">Sem custo</option><option value="sem_foto">Sem foto</option><option value="sem_estoque">Sem estoque</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="erro">Com erro</option><option value="">Todos</option></select>
-<button onclick="sel50()">Marcar os próximos 50</button><button onclick="selNone()">Limpar seleção</button><span class="tag" id="cont"></span></div>
-<div class="tw"><table><thead><tr><th></th><th>SKU</th><th>Título</th><th class="n">Custo</th><th class="n">Preço</th><th class="n">Preço ML</th><th class="n">vs ML</th><th class="n">Lucro</th><th class="n">Est.</th><th class="n">Fotos</th><th>Situação</th></tr></thead><tbody id="tb"></tbody></table></div>
-</section></main>
-<div class="bottom"><div class="in"><button class="pri" id="bEnv" onclick="enviar()" disabled>Enviar selecionados</button><span id="selinfo" class="tag">0 selecionados</span><span style="color:var(--mut);font-size:13px">Máximo de 50 por envio.</span></div></div>
+<div style="margin-top:12px"><label>Atributos obrigatórios da Shopee (JSON: nome e valor; use {sku} para o código do produto)</label><textarea id="atributos" rows="3"></textarea></div>
+<div class="row" style="margin-top:12px"><label style="display:flex;gap:8px;align-items:center;margin:0"><input type="checkbox" id="criar_sem_estoque"> Criar também itens sem estoque no ML</label><button class="pri" onclick="salvar()">Salvar e recalcular preços</button></div>
+</div></section>
+</main>
+<div class="bottom" id="bar"><div class="in"><button class="pri" id="bEnv" onclick="enviar()" disabled>Enviar selecionados</button><span id="selinfo" class="tag">0 selecionados</span><span id="smsg" class="mut"></span><span class="mut" style="margin-left:auto">Dá para enviar enquanto a análise roda. Máximo de 50 por envio.</span></div></div>
 <script>
-let S=null,sel=new Set();
+let S=null,sel=new Set(),tab=(location.hash||'#anuncios').slice(1),filt='pendente';
 const $=id=>document.getElementById(id);
 const acima=c=>c.dif!=null&&c.dif>Number((S&&S.settings.alerta_acima_ml)||0);
 const brl=v=>v==null?'-':'R$ '+Number(v).toFixed(2).replace('.',',');
 const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const NOMES={shopee:'Shopee',ml:'Mercado Livre (Duplo Giro)',bling:'Bling M3'};
+const NOMES={ml:'Mercado Livre (Duplo Giro)',bling:'Bling M3',shopee:'Shopee'};
 const SIT={pendente:['Pronto','ok'],bloqueado:['Bloqueado','warn'],sem_custo:['Sem custo','bad'],sem_foto:['Sem foto','bad'],sem_estoque:['Sem estoque','warn'],simulado:['Simulado','warn'],criado:['Criado','ok'],erro:['Erro','bad'],erro_preco:['Erro de preço','bad']};
+const PROB=['sem_custo','sem_foto','sem_estoque','bloqueado','erro','erro_preco'];
+const match=(c,f)=>f==='acima'?acima(c):f==='problemas'?PROB.includes(c.status):(!f||c.status===f);
+function go(t){tab=t;location.hash=t;draw()}
+function setF(f){filt=f;draw()}
 async function load(){const r=await fetch('/api/state');S=await r.json();draw();}
 function draw(){
  if(!S)return;
- $('modo').innerHTML=S.dry?'<span class="sim">Modo simulação: nada é criado na Shopee</span>':'<span class="live">Modo real: os anúncios serão criados</span>';
+ ['anuncios','conexoes','regras'].forEach(t=>{$('p-'+t).hidden=tab!==t;$('t-'+t).classList.toggle('on',tab===t)});
+ $('bar').hidden=tab!=='anuncios';
+ $('modo').innerHTML=S.dry?'<span class="mode sim">Modo simulação: nada é criado</span>':'<span class="mode live">Modo real: cria na Shopee</span>';
+ $('dots').innerHTML=Object.keys(NOMES).map(k=>`<span title="${NOMES[k]}"><i class="dot ${S.conn[k]?'ok':''}"></i>${k==='ml'?'ML':k==='bling'?'Bling':'Shopee'}</span>`).join('');
  $('conns').innerHTML=Object.keys(NOMES).map(k=>{const on=S.conn[k],cfg=S.cfg_ok[k];
-  return `<div class="conn"><span>${NOMES[k]}</span><span class="row"><span class="tag ${on?'ok':'bad'}">${on?'Conectado':(cfg?'Não conectado':'Faltam variáveis no Render')}</span>${cfg?`<a class="btn" href="/connect/${k}">${on?'Reconectar':'Conectar'}</a>`:''}</span></div>`}).join('');
+  return `<div class="conn"><b>${NOMES[k]}</b><span class="row"><span class="tag ${on?'ok':'bad'}">${on?'Conectado':(cfg?'Não conectado':'Faltam variáveis no Render')}</span>${cfg?`<a class="btn" href="/connect/${k}">${on?'Reconectar':'Conectar'}</a>`:''}</span></div>`}).join('');
  const st=S.settings,f=(id,v)=>{const e=$(id);if(document.activeElement!==e){if(e.type==='checkbox')e.checked=!!v;else e.value=v}};
  f('lucro',st.lucro);f('promo',st.promo);f('imposto',st.imposto);f('piso',st.piso);f('alerta_acima_ml',st.alerta_acima_ml);f('prefixos',st.prefixos);f('categoria_id',st.categoria_id);f('peso_padrao',st.peso_padrao);f('dim_padrao',st.dim_padrao.join(' x '));f('atributos',JSON.stringify(st.atributos));f('criar_sem_estoque',st.criar_sem_estoque);
- const j=S.job;$('jobtag').textContent=j.running?(j.kind==='analisar'?'Analisando...':'Enviando...'):'Parado';
- $('prog').style.width=(j.total?Math.round(j.done/j.total*100):0)+'%';$('log').textContent=j.log.join('\n');$('log').scrollTop=1e9;
- $('bAn').disabled=j.running;
- const fl=$('filtro').value,all=S.cands.filter(c=>fl==='acima'?acima(c):(!fl||c.status===fl)),rows=all.slice(0,500);
+ const n=fn=>S.cands.filter(fn).length;
+ const T=[['pendente','Prontos para enviar',n(c=>c.status==='pendente'&&!acima(c)),'ok'],['acima','Acima do preço do ML',n(acima),'warn'],['problemas','Com pendência',n(c=>PROB.includes(c.status)),'bad'],['criado','Criados na Shopee',n(c=>c.status==='criado'),'']];
+ $('tiles').innerHTML=T.map(t=>`<button class="tile ${t[3]} ${filt===t[0]?'on':''}" onclick="setF('${t[0]}')"><span class="num">${t[2]}</span><span>${t[1]}</span></button>`).join('');
+ $('filtro').value=filt;
+ const a=S.job,s=S.job_send;
+ $('amsg').textContent=a.running?a.msg:(a.log.length?a.msg:'Pronto para analisar');
+ $('aprog').style.width=(a.total?Math.round(a.done/a.total*100):0)+'%';$('alog').textContent=a.log.join('\n');
+ $('smsg').textContent=s.running?('Enviando '+s.done+' de '+s.total+'...'):(s.log.length?s.msg:'');
+ $('bAn').disabled=a.running;
+ const all=S.cands.filter(c=>match(c,filt)),rows=all.slice(0,500);
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
- $('tb').innerHTML=rows.length?rows.map(c=>{const s=SIT[c.status]||[c.status,''];const can=c.status==='pendente'||c.status==='simulado'||c.status==='erro'||c.status==='bloqueado';
-  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${s[1]}">${s[0]}</span>${c.msg?`<div style="color:var(--mut);font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" style="color:var(--mut);padding:18px">Nada por aqui. Clique em "Analisar ML x Shopee" para buscar os anúncios que faltam.</td></tr>';
+ $('tb').innerHTML=rows.length?rows.map(c=>{const g=SIT[c.status]||[c.status,''];const can=['pendente','simulado','erro','bloqueado'].includes(c.status);
+  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${g[1]}">${g[0]}</span>${c.msg?`<div class="mut" style="font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" class="mut" style="padding:22px">Nenhum item neste filtro. Clique em Analisar para buscar os anúncios que faltam na Shopee.</td></tr>';
  upd();
 }
-function upd(){$('selinfo').textContent=sel.size+' selecionados';$('bEnv').disabled=!sel.size||(S&&S.job.running)}
+function upd(){$('selinfo').textContent=sel.size+' selecionados';$('bEnv').disabled=!sel.size||(S&&S.job_send.running)}
 function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_lote+' por envio.');draw();return}sel.add(s)}else sel.delete(s);upd()}
 function sel50(){sel.clear();S.cands.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
