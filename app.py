@@ -609,6 +609,11 @@ def job_analisar():
     faltam = {k: v for k, v in ml.items() if k not in shp}
     jlog(f"{len(faltam)} SKUs estão no ML e não estão na Shopee")
     antigos = {r[0]: r[1] for r in run("SELECT sku, status FROM cria_cand", (), True)}
+    if JOBS["enviar"]["running"]:
+        jlog("Há um envio em andamento: mantive a lista atual até ele terminar")
+    else:
+        run("DELETE FROM cria_cand WHERE status<>?", ("criado",))
+        jlog("Lista anterior zerada (os itens já criados foram mantidos)")
     J()["total"] = len(faltam)
     try:
         jlog(f"Bling conectado: {bling_empresa()}")
@@ -683,7 +688,7 @@ def enviar_um(sku, s):
     body = {
         "original_price": d["preco"], "description": texto, "item_name": d["titulo"][:120],
         "item_status": "NORMAL", "item_sku": d["sku"], "condition": "NEW", "category_id": cat,
-        "normal_stock": d["qtd"], "weight": round(float(peso), 3),
+        "seller_stock": [{"stock": int(d["qtd"])}], "weight": round(float(peso), 3),
         "dimension": {"package_length": int(dm[0]), "package_width": int(dm[1]), "package_height": int(dm[2])},
         "logistic_info": sp_logistics(), "image": {"image_id_list": ids},
         "brand": {"brand_id": 0, "original_brand_name": "NoBrand"}, "attribute_list": attrs,
@@ -910,6 +915,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="card"><div class="row"><button class="pri" id="bAn" onclick="analisar()">Analisar Mercado Livre e Shopee</button><span id="amsg" class="mut"></span></div>
 <div class="bar"><i id="aprog"></i></div>
 <details><summary class="mut" style="cursor:pointer">Ver detalhes da análise</summary><div id="alog"></div></details></div>
+<details class="card"><summary class="mut" style="cursor:pointer">Ver detalhes do envio</summary><div id="slog"></div></details>
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Anúncios para criar</h2>
 <select id="filtro" onchange="setF(this.value)" style="width:auto"><option value="pendente">Prontos</option><option value="acima">Acima do ML</option><option value="problemas">Com pendência</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="">Todos</option></select>
 <button onclick="sel50()">Marcar 50</button><button onclick="selNone()">Limpar</button><span class="tag" id="cont"></span></div>
@@ -967,7 +973,7 @@ function draw(){
  $('amsg').textContent=a.running?a.msg:(a.log.length?a.msg:'Pronto para analisar');
  $('aprog').style.width=(a.total?Math.round(a.done/a.total*100):0)+'%';$('alog').textContent=a.log.join('\n');
  $('smsg').textContent=s.running?('Enviando '+s.done+' de '+s.total+'...'):(s.log.length?s.msg:'');
- $('bAn').disabled=a.running;
+ $('slog').textContent=s.log.join('\n');$('bAn').disabled=a.running;
  const all=S.cands.filter(c=>match(c,filt)),rows=all.slice(0,500);
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
  $('tb').innerHTML=rows.length?rows.map(c=>{const g=SIT[c.status]||[c.status,''];const can=['pendente','simulado','erro','bloqueado'].includes(c.status);
