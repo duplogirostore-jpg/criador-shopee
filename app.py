@@ -946,6 +946,7 @@ def job_full():
         else:
             st = "sem_estoque"
         linhas.append({"sku": g["sku"], "titulo": g["titulo"], "mlbs": " | ".join(m.replace("MLB", "") for m in g["mlbs"]),
+                       "mlb": max(g["mlbs"], key=lambda m: vend.get(m, 0)).replace("MLB", ""),
                        "vendas": g["vendas"], "full": g["full"], "alvo": alvo, "sug": sug, "bl": bl,
                        "det": " · ".join(f"{c}: {int(v) if v is not None else '?'}" for c, v in vals),
                        "status": st, "manual": g["manual"]})
@@ -1263,7 +1264,8 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="bar"><i id="fprog"></i></div>
 <label style="margin-top:10px">MLBs extras para incluir (um por linha ou separados por vírgula)</label>
 <textarea id="fmanual" rows="2" placeholder="6838348720, MLB4708874253"></textarea>
-<div class="row" style="margin-top:8px"><button onclick="saveManual()">Salvar lista e atualizar</button><span class="mut">Meta de cobertura: <b id="fdias"></b> dias (muda em Regras de preço).</span></div></div>
+<div class="row" style="margin-top:8px"><button onclick="saveManual()">Salvar lista e atualizar</button><span class="mut">Meta de cobertura: <b id="fdias"></b> dias (muda em Regras de preço).</span></div>
+<div class="row" style="margin-top:10px"><label style="margin:0">Enviar só o que vendeu pelo menos</label><input type="number" id="fmin" min="0" value="0" style="width:90px" onchange="setMin()"><span class="mut">unidades em 30 dias. MLBs extras ficam fora desse filtro.</span></div></div>
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Reposição por SKU</h2>
 <select id="ffiltro" onchange="drawFull()" style="width:auto"><option value="">Todos</option><option value="enviar">A enviar</option><option value="sem">Sem estoque no Bling M3</option><option value="coberto">Cobertos</option></select>
 <button onclick="baixarCsv()">Baixar CSV</button><span class="tag" id="fcont"></span></div>
@@ -1339,25 +1341,30 @@ function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_l
 function sel50(){sel.clear();S.cands.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)alert(j.erro||'Erro');return j}
-let F=null,fq=null,envMap={};
-const fenv=l=>envMap[l.sku]!==undefined?envMap[l.sku]:(l.bl==null?l.sug:Math.min(l.sug,l.bl));
+let F=null,fq=null,envMap={},fmin=Number(localStorage.getItem('fmin')||0);
+const fenv=l=>envMap[l.sku]!==undefined?envMap[l.sku]:((l.vendas<fmin&&!l.manual)?0:(l.bl==null?l.sug:Math.min(l.sug,l.bl)));
+function setMin(){fmin=Math.max(0,Math.floor(+$('fmin').value||0));localStorage.setItem('fmin',fmin);drawFull()}
 const FS={coberto:['Coberto','ok'],enviar:['Enviar','ok'],parcial:['Bling não cobre','warn'],sem_estoque:['Sem estoque no Bling','bad'],sem_bling:['Não achei no Bling','bad']};
 async function loadFull(){const r=await fetch('/api/full');F=await r.json();fq=F.quando;if(document.activeElement!==$('fmanual'))$('fmanual').value=(F.manual||[]).join('\n');drawFull()}
+function drawTiles(){
+ const L=F.linhas,c=f=>L.filter(f).length,env=L.filter(l=>fenv(l)>0),pecas=env.reduce((x,l)=>x+fenv(l),0);
+ $('ftiles').innerHTML=[['Peças a enviar',pecas,'ok'],['SKUs a enviar',env.length,'ok'],['Sem estoque no Bling M3',c(l=>['sem_estoque','sem_bling'].includes(l.status)),'bad'],['Já cobertos',c(l=>l.status==='coberto'),''],['SKUs analisados',L.length,'']].map(t=>`<div class="tile ${t[2]}"><span class="num">${t[1]}</span><span>${t[0]}</span></div>`).join('')}
 function drawFull(){
  if(!F)return;
  $('fquando').textContent=F.quando?'Última análise: '+F.quando+' (UTC)':'Ainda não analisado';
- const L=F.linhas,c=f=>L.filter(f).length;
- $('ftiles').innerHTML=[['A enviar',c(l=>['enviar','parcial'].includes(l.status)),'ok'],['Sem estoque no Bling M3',c(l=>['sem_estoque','sem_bling'].includes(l.status)),'bad'],['Já cobertos',c(l=>l.status==='coberto'),''],['SKUs analisados',L.length,'']].map(t=>`<div class="tile ${t[2]}"><span class="num">${t[1]}</span><span>${t[0]}</span></div>`).join('');
- const fl=$('ffiltro').value,rows=L.filter(l=>!fl||(fl==='enviar'?['enviar','parcial'].includes(l.status):fl==='sem'?['sem_estoque','sem_bling'].includes(l.status):l.status==='coberto'));
+ drawTiles();
+ if(document.activeElement!==$('fmin'))$('fmin').value=fmin;
+ const L=F.linhas;
+ const fl=$('ffiltro').value,rows=L.filter(l=>!fl||(fl==='enviar'?fenv(l)>0:fl==='sem'?['sem_estoque','sem_bling'].includes(l.status):l.status==='coberto'));
  $('fcont').textContent=rows.length+' SKUs';
- $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td><td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="envMap['${esc(l.sku)}']=Math.max(0,Math.floor(+this.value||0))"></td><td><span class="tag ${g[1]}">${g[0]}</span></td></tr>`}).join(''):'<tr><td colspan="10" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
+ $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td><td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="envMap['${esc(l.sku)}']=Math.max(0,Math.floor(+this.value||0));drawTiles()"></td><td><span class="tag ${g[1]}">${g[0]}</span></td></tr>`}).join(''):'<tr><td colspan="10" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
 }
 async function runFull(){await post('/api/full/run');load()}
 async function saveManual(){await post('/api/full/manual',{texto:$('fmanual').value});await runFull()}
 function baixarCsv(){
  const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
  const L=(F?F.linhas:[]).filter(l=>fenv(l)>0);
- const csv=['SKU;Titulo;MLBs;Vendas 30d;Saldo Full;Meta;Sugerido;Bling M3;Enviar'].concat(L.map(l=>[l.sku,l.titulo,l.mlbs,l.vendas,l.full,l.alvo,l.sug,l.bl==null?'':l.bl,fenv(l)].map(q).join(';'))).join('\n');
+ const csv=['MLB;SKU;Titulo;Vendas 30d;Saldo Full;Meta;Sugerido;Bling M3;Enviar'].concat(L.map(l=>[l.mlb||String(l.mlbs).split(' | ')[0],l.sku,l.titulo,l.vendas,l.full,l.alvo,l.sug,l.bl==null?'':l.bl,fenv(l)].map(q).join(';'))).join('\n');
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));a.download='novo-envio-full.csv';a.click()}
 async function sync(){await post('/api/sync');load()}
 async function analisar(){await post('/api/analyze');load()}
