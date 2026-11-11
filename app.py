@@ -723,7 +723,8 @@ def aplica_regras(d, s):
         return "sem_foto", "anúncio do ML sem fotos"
     if estoque_inicial(d) <= 0 and not s["criar_sem_estoque"]:
         return "sem_estoque", "sem estoque no Bling M3"
-    p = calc_price(d["custo"], s)
+    pm = (kv_get("precos_manuais", {}) or {}).get(d["sku"])
+    p = pm or calc_price(d["custo"], s)
     if not p:
         return "erro_preco", "não foi possível calcular o preço"
     d["preco"] = p
@@ -1044,7 +1045,7 @@ def job_full():
         jlog(f"Consulta fiscal no ML: {ML_FISC['erro']}")
     if n_ok == 0 and n_falta > 3:
         jlog("Aviso: nenhum item voltou com NCM. Se isso não bate com a realidade, a consulta pode não estar disponível para a sua conta")
-    linhas.sort(key=lambda x: (-x["sug"], x["sku"]))
+    linhas.sort(key=lambda x: (-x["vendas"], x["sku"]))
     kv_set("full_snap", {"quando": now(), "linhas": linhas})
     jlog(f"Análise do Full concluída: {len(linhas)} SKUs")
 
@@ -1125,13 +1126,15 @@ def callback(svc):
 @app.route("/api/state")
 def api_state():
     rows = run("SELECT sku, data, status, msg FROM cria_cand ORDER BY status, sku", (), True)
+    pm_all = kv_get("precos_manuais", {}) or {}
     cands = []
     for sku, data, st, msg in rows:
         d = json.loads(data)
         cands.append({"sku": sku, "titulo": d.get("titulo"), "custo": d.get("custo"), "preco": d.get("preco"),
                       "lucro": (d.get("calc") or {}).get("lucro"), "qtd": estoque_inicial(d),
                       "fotos": len(d.get("fotos") or []), "status": st, "msg": msg, "link": d.get("link"),
-                      "preco_ml": d.get("preco_ml"), "dif": d.get("dif_ml")})
+                      "preco_ml": d.get("preco_ml"), "dif": d.get("dif_ml"),
+                      "preco_manual": d["sku"] in pm_all})
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
@@ -1228,7 +1231,7 @@ def api_sync():
 def api_full():
     snap = kv_get("full_snap", {}) or {}
     return jsonify({"quando": snap.get("quando"), "linhas": snap.get("linhas", []),
-                    "manual": kv_get("full_manual", []) or [], "pedidos": kv_get("full_pedidos", []) or [], "dias": settings().get("dias_cobertura")})
+                    "manual": kv_get("full_manual", []) or [], "pedidos": kv_get("full_pedidos", []) or [], "ajustes": kv_get("full_ajustes", {}) or {}, "dias": settings().get("dias_cobertura")})
 
 
 @app.route("/api/full/run", methods=["POST"])
@@ -1254,6 +1257,7 @@ def api_full_pedido():
     nome = str(j.get("nome") or "").strip() or f"Pedido {len(ped) + 1:02d}"
     ped.append({"nome": nome, "data": str(j.get("data") or ""), "criado": now(), "itens": itens, "total": sum(itens.values())})
     kv_set("full_pedidos", ped)
+    kv_set("full_ajustes", {})   # novo ciclo: marcações e quantidades começam do zero
     return jsonify({"ok": True})
 
 
@@ -1261,6 +1265,46 @@ def api_full_pedido():
 def api_full_pedido_excluir():
     nome = str((request.get_json(force=True) or {}).get("nome", ""))
     kv_set("full_pedidos", [p for p in (kv_get("full_pedidos", []) or []) if p.get("nome") != nome])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/full/ajuste", methods=["POST"])
+def api_full_ajuste():
+    """Guarda marcação (sel) e quantidade (qtd) escolhidas por SKU; valem também para a próxima análise."""
+    j = request.get_json(force=True) or {}
+    aj = kv_get("full_ajustes", {}) or {}
+    for k, v in (j.get("lote") or {}).items():
+        aj.setdefault(str(k), {})["sel"] = bool(v)
+    if j.get("sku"):
+        cur = aj.setdefault(str(j["sku"]), {})
+        if "sel" in j:
+            cur["sel"] = bool(j["sel"])
+        if "qtd" in j:
+            cur["qtd"] = max(0, int(j["qtd"] or 0))
+    kv_set("full_ajustes", aj)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/preco", methods=["POST"])
+def api_preco():
+    """Preço ajustado à mão para um SKU (fica salvo para as próximas análises; vazio ou 0 volta ao cálculo)."""
+    j = request.get_json(force=True) or {}
+    sku = str(j.get("sku") or "")
+    pm = kv_get("precos_manuais", {}) or {}
+    try:
+        v = float(str(j.get("preco")).replace(",", "."))
+    except Exception:
+        v = 0
+    if v > 0:
+        pm[sku] = round(v, 2)
+    else:
+        pm.pop(sku, None)
+    kv_set("precos_manuais", pm)
+    row = run("SELECT data, status FROM cria_cand WHERE sku=?", (sku,), True)
+    if row and row[0][1] != "criado":
+        d = json.loads(row[0][0])
+        ns, msg = aplica_regras(d, settings())
+        set_cand(sku, d, ns, msg)
     return jsonify({"ok": True})
 
 
@@ -1348,9 +1392,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
 #alog,#slog{font:12px/1.6 ui-monospace,Menlo,Consolas,monospace;color:var(--mut);max-height:140px;overflow:auto;white-space:pre-wrap;margin-top:8px}
 .tag{font-size:12px;font-weight:600;padding:2px 9px;border-radius:99px;background:var(--soft);color:var(--mut)}
 .tag.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}.tag.bad{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}.tag.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
-.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:900px}
+.tw{overflow:auto;max-height:72vh}table{border-collapse:collapse;width:100%;min-width:900px}
 th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{font-size:12px;color:var(--mut);font-weight:600}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+th{font-size:12px;color:var(--mut);font-weight:600;position:sticky;top:0;z-index:2;background:var(--panel);box-shadow:0 1px 0 var(--line)}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 td a{color:var(--ink)}
 .conn{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:14px 0;border-bottom:1px solid var(--line)}.conn:last-child{border:0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
@@ -1374,7 +1418,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <details class="card"><summary class="mut" style="cursor:pointer">Ver detalhes do envio</summary><div id="slog"></div></details>
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Anúncios para criar</h2>
 <select id="filtro" onchange="setF(this.value)" style="width:auto"><option value="pendente">Prontos</option><option value="acima">Acima do ML</option><option value="problemas">Com pendência</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="">Todos</option></select>
-<button onclick="sel50()">Marcar 50</button><button onclick="selNone()">Limpar</button><span class="tag" id="cont"></span></div>
+<select id="ord" onchange="draw()" style="width:auto"><option value="sku">Ordem: SKU</option><option value="estoque">Maior estoque</option><option value="lucro">Maior lucro</option><option value="dif">Menor vs ML</option></select><button onclick="sel50()">Marcar 50</button><button onclick="selNone()">Limpar</button><span class="tag" id="cont"></span></div>
 <div class="tw"><table><thead><tr><th></th><th>SKU</th><th>Título</th><th class="n">Custo</th><th class="n">Preço</th><th class="n">Preço ML</th><th class="n">vs ML</th><th class="n">Lucro</th><th class="n">Est.</th><th class="n">Fotos</th><th>Situação</th></tr></thead><tbody id="tb"></tbody></table></div></div>
 </section>
 
@@ -1389,7 +1433,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Reposição por SKU</h2>
 <select id="ffiltro" onchange="drawFull()" style="width:auto"><option value="">Todos</option><option value="enviar">A enviar</option><option value="fiscal">Sem dados fiscais</option><option value="sem">Sem estoque no Bling M3</option><option value="coberto">Cobertos</option></select>
 <button onclick="baixarCsv()">Baixar envio</button><button onclick="baixarCompra()">Baixar compra</button><button onclick="baixarFiscal()">Pendências fiscais</button><span class="tag" id="fcont"></span></div>
-<div class="tw"><table><thead><tr><th>SKU</th><th>Título</th><th>MLBs</th><th class="n">Vendas 30d</th><th class="n">Último pedido</th><th class="n">Saldo Full</th><th class="n">Meta</th><th class="n">Sugerido</th><th class="n">Bling M3</th><th class="n">Enviar</th><th>Situação</th><th>Dados fiscais</th></tr></thead><tbody id="ftb"></tbody></table></div></div>
+<div class="tw"><table><thead><tr><th><input type="checkbox" onchange="selAll(this.checked)" aria-label="Marcar todos"></th><th>SKU</th><th>Título</th><th>MLBs</th><th class="n">Vendas 30d</th><th class="n">Último pedido</th><th class="n">Saldo Full</th><th class="n">Meta</th><th class="n">Sugerido</th><th class="n">Bling M3</th><th class="n">Enviar</th><th>Situação</th><th>Dados fiscais</th></tr></thead><tbody id="ftb"></tbody></table></div></div>
 <div class="card"><h2>Finalizar pedido</h2><div class="row"><input type="text" id="fped_nome" placeholder="Nome (ex.: Pedido 01)" style="width:210px"><input type="date" id="fped_data" style="width:170px"><button class="pri" onclick="finalizarPedido()">Finalizar e salvar no histórico</button></div>
 <p class="mut">Salva as quantidades da coluna Enviar. Depois elas aparecem em Último pedido.</p><div id="fhist"></div></div>
 </section>
@@ -1452,19 +1496,26 @@ function draw(){
  const fj=S.job_full;$('fmsg').textContent=fj.running?fj.msg:(fj.log.length?fj.msg:'');$('fprog').style.width=(fj.total?Math.round(fj.done/fj.total*100):0)+'%';$('bFull').disabled=fj.running;$('fdias').textContent=S.settings.dias_cobertura;
  if(tab==='full'&&S.full_quando!==fq)loadFull();
  $('bAn').disabled=a.running;
- const all=S.cands.filter(c=>match(c,filt)),rows=all.slice(0,500);
+ const ordf={sku:(a,b)=>a.sku.localeCompare(b.sku),estoque:(a,b)=>(b.qtd||0)-(a.qtd||0),lucro:(a,b)=>(b.lucro||0)-(a.lucro||0),dif:(a,b)=>(a.dif==null)-(b.dif==null)||(a.dif||0)-(b.dif||0)};
+ const all=S.cands.filter(c=>match(c,filt)).sort(ordf[$('ord').value]||ordf.sku),rows=all.slice(0,500);visAn=all;
  $('cont').textContent=all.length+' itens'+(all.length>500?' (mostrando 500)':'');
- $('tb').innerHTML=rows.length?rows.map(c=>{const g=SIT[c.status]||[c.status,''];const can=['pendente','simulado','erro','bloqueado'].includes(c.status);
-  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${brl(c.preco)}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${g[1]}">${g[0]}</span>${c.msg?`<div class="mut" style="font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" class="mut" style="padding:22px">Nenhum item neste filtro. Clique em Analisar para buscar os anúncios que faltam na Shopee.</td></tr>';
+ if(!(document.activeElement&&$('tb').contains(document.activeElement)&&document.activeElement.type==='number'))$('tb').innerHTML=rows.length?rows.map(c=>{const g=SIT[c.status]||[c.status,''];const can=['pendente','simulado','erro','bloqueado'].includes(c.status);
+  return `<tr><td><input type="checkbox" ${can?'':'disabled'} ${sel.has(c.sku)?'checked':''} onchange="tog('${esc(c.sku)}',this.checked)" aria-label="Selecionar ${esc(c.sku)}"></td><td>${esc(c.sku)}</td><td>${c.link?`<a href="${esc(c.link)}" target="_blank" rel="noopener">${esc(c.titulo)}</a>`:esc(c.titulo)}</td><td class="n">${brl(c.custo)}</td><td class="n">${c.preco==null?'-':`<input type="number" step="0.01" min="0" value="${Number(c.preco).toFixed(2)}" style="width:92px;padding:5px;text-align:right${c.preco_manual?';border-color:var(--acc)':''}" onchange="setPreco('${esc(c.sku)}',this.value)" title="${c.preco_manual?'Preço ajustado por você':'Preço calculado pelas regras'}">`}</td><td class="n">${brl(c.preco_ml)}</td><td class="n" style="${acima(c)?'color:var(--bad);font-weight:600':''}">${c.dif==null?'-':(c.dif>0?'+':'')+Number(c.dif).toFixed(0)+'%'}</td><td class="n">${brl(c.lucro)}</td><td class="n">${c.qtd??'-'}</td><td class="n">${c.fotos}</td><td><span class="tag ${g[1]}">${g[0]}</span>${c.msg?`<div class="mut" style="font-size:12px;margin-top:3px">${esc(c.msg)}</div>`:''}</td></tr>`}).join(''):'<tr><td colspan="11" class="mut" style="padding:22px">Nenhum item neste filtro. Clique em Analisar para buscar os anúncios que faltam na Shopee.</td></tr>';
  upd();
 }
 function upd(){$('selinfo').textContent=sel.size+' selecionados';$('bEnv').disabled=!sel.size||(S&&S.job_send.running)}
 function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_lote+' por envio.');draw();return}sel.add(s)}else sel.delete(s);upd()}
-function sel50(){sel.clear();S.cands.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
+function sel50(){sel.clear();visAn.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)alert(j.erro||'Erro');return j}
 let F=null,fq=null,envMap={},fmin=Number(localStorage.getItem('fmin')||0);
-const fenv=l=>envMap[l.sku]!==undefined?envMap[l.sku]:((l.vendas<fmin&&!l.manual)?0:(l.bl==null?l.sug:Math.min(l.sug,l.bl)));
+let visRows=[],visAn=[];
+const aj=sku=>{F.ajustes=F.ajustes||{};return F.ajustes[sku]=F.ajustes[sku]||{}};
+const fsel=l=>{const a=(F.ajustes||{})[l.sku];if(a&&a.sel!==undefined)return a.sel;if(a&&a.qtd>0)return true;return (l.status==='enviar'&&l.vendas>=fmin)||(l.manual&&l.sug>0)};
+const fenv=l=>{if(!fsel(l))return 0;const a=(F.ajustes||{})[l.sku];return a&&a.qtd!==undefined?a.qtd:l.sug};
+function setSel(sku,v){aj(sku).sel=v;drawFull();post('/api/full/ajuste',{sku,sel:v})}
+function setQtd(sku,v){const q=Math.max(0,Math.floor(+v||0)),a=aj(sku);a.qtd=q;a.sel=q>0;drawFull();post('/api/full/ajuste',{sku,qtd:q,sel:q>0})}
+function selAll(v){const lote={};visRows.forEach(l=>{aj(l.sku).sel=v;lote[l.sku]=v});drawFull();post('/api/full/ajuste',{lote})}
 function setMin(){fmin=Math.max(0,Math.floor(+$('fmin').value||0));localStorage.setItem('fmin',fmin);drawFull()}
 const FS={coberto:['Coberto','ok'],enviar:['Enviar','ok'],parcial:['Bling não cobre','warn'],sem_estoque:['Sem estoque no Bling','bad'],sem_bling:['Não achei no Bling','bad']};
 async function loadFull(){const r=await fetch('/api/full');F=await r.json();fq=F.quando;if(document.activeElement!==$('fmanual'))$('fmanual').value=(F.manual||[]).join('\n');drawFull()}
@@ -1507,8 +1558,8 @@ function drawFull(){
  if(document.activeElement!==$('fmin'))$('fmin').value=fmin;
  const L=F.linhas;
  const fl=$('ffiltro').value,rows=L.filter(l=>!fl||(fl==='enviar'?fenv(l)>0:fl==='fiscal'?(fenv(l)>0&&!!l.fiscal&&l.fiscal.length>0):fl==='sem'?['sem_estoque','sem_bling'].includes(l.status):l.status==='coberto'));
- $('fcont').textContent=rows.length+' SKUs';drawHist();
- $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td>${ultCell(l)}<td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="envMap['${esc(l.sku)}']=Math.max(0,Math.floor(+this.value||0));drawTiles()"></td><td><span class="tag ${g[1]}">${g[0]}</span></td>${fiscCell(l)}</tr>`}).join(''):'<tr><td colspan="12" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
+ rows.sort((a,b)=>b.vendas-a.vendas||a.sku.localeCompare(b.sku));visRows=rows;$('fcont').textContent=rows.length+' SKUs';drawHist();
+ $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td><input type="checkbox" ${fsel(l)?'checked':''} onchange="setSel('${esc(l.sku)}',this.checked)" aria-label="Marcar ${esc(l.sku)}"></td><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td>${ultCell(l)}<td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="setQtd('${esc(l.sku)}',this.value)"></td><td><span class="tag ${g[1]}">${g[0]}</span></td>${fiscCell(l)}</tr>`}).join(''):'<tr><td colspan="13" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
 }
 async function runFull(){await post('/api/full/run');load()}
 async function saveManual(){await post('/api/full/manual',{texto:$('fmanual').value});await runFull()}
@@ -1517,6 +1568,7 @@ function baixarCsv(){
  const L=(F?F.linhas:[]).filter(l=>fenv(l)>0);
  const csv=['MLB;SKU;Titulo;Vendas 30d;Saldo Full;Meta;Sugerido;Bling M3;Enviar'].concat(L.map(l=>[l.mlb||String(l.mlbs).split(' | ')[0],l.sku,l.titulo,l.vendas,l.full,l.alvo,l.sug,l.bl==null?'':l.bl,fenv(l)].map(q).join(';'))).join('\n');
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));a.download='novo-envio-full.csv';a.click()}
+async function setPreco(sku,v){await post('/api/preco',{sku,preco:v});load()}
 async function sync(){await post('/api/sync');load()}
 async function analisar(){await post('/api/analyze');load()}
 async function enviar(){
