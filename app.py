@@ -44,6 +44,7 @@ if USE_PG:
     import psycopg2
 
 MAX_LOTE = 50
+BLING_LOJA_PADRAO = "206201445"   # loja "Shopee - Duplo Giro" no Bling M3 (vista num vínculo que já funciona)
 
 DEFAULTS = {
     "prefixos": "SM",            # só SKUs que começam com isso (vírgula separa; vazio = todos)
@@ -549,19 +550,8 @@ def bl_post(path, body, method="POST"):
 
 
 def bling_loja_id():
-    """ID da loja Shopee cadastrada no Bling M3 (o 'carrinho' do produto)."""
-    cfg = str(settings().get("bling_loja_id") or "").strip()
-    if cfg:
-        return int(cfg)
-    code, r = bl_get("/lojas")
-    if code != 200:
-        raise RuntimeError(f"Bling /lojas respondeu {code}: {str(r)[:160]}")
-    lojas = [l for l in (r.get("data") or []) if "shopee" in norm(json.dumps(l, ensure_ascii=False))]
-    pref = [l for l in lojas if "duplo" in norm(json.dumps(l, ensure_ascii=False))]
-    achadas = pref or lojas
-    if len(achadas) != 1:
-        raise RuntimeError("não identifiquei a loja Shopee no Bling; informe o ID em Regras de preço")
-    return int(achadas[0]["id"])
+    """ID da loja Shopee - Duplo Giro no Bling M3 (a API do Bling não lista as lojas)."""
+    return int(str(settings().get("bling_loja_id") or "").strip() or BLING_LOJA_PADRAO)
 
 
 def bling_vincular(sku, item_id, preco):
@@ -571,10 +561,13 @@ def bling_vincular(sku, item_id, preco):
         raise RuntimeError(f"produto {sku} não achado no Bling")
     pid = r["data"][0]["id"]
     loja = bling_loja_id()
-    code, r = bl_get("/produtos/lojas", {"idProduto": pid, "idLoja": loja})
-    atual = (r.get("data") or []) if code == 200 else []
+    code, r = bl_get("/produtos/lojas", {"idProduto": pid})
+    # só os vínculos DESTA loja; os do Mercado Livre e de outras lojas nunca são alterados
+    atual = [l for l in ((r.get("data") or []) if code == 200 else [])
+             if int((l.get("loja") or {}).get("id") or 0) == loja]
     body = {"codigo": str(item_id), "preco": preco, "precoPromocional": preco,
-            "produto": {"id": pid}, "loja": {"id": loja}}
+            "produto": {"id": pid}, "loja": {"id": loja},
+            "fornecedorLoja": {"id": 0}, "marcaLoja": {"id": 0}, "categoriasProdutos": []}
     if atual:
         code, r = bl_post(f"/produtos/lojas/{atual[0]['id']}", body, "PUT")
     else:
@@ -1449,7 +1442,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div><label>Preço mínimo anunciado (R$)</label><input type="number" step="0.01" id="piso"></div>
 <div><label>Alerta: % acima do preço do ML</label><input type="number" step="1" id="alerta_acima_ml"></div>
 <div><label>Cobertura do Full (dias)</label><input type="number" step="1" id="dias_cobertura"></div>
-<div><label>ID da loja Shopee no Bling (vazio = automático)</label><input type="text" id="bling_loja_id"></div>
+<div><label>ID da loja Shopee - Duplo Giro no Bling (vazio = 206201445)</label><input type="text" id="bling_loja_id"></div>
 <div><label>Prefixos de SKU (vírgula)</label><input type="text" id="prefixos"></div>
 <div><label>ID da categoria Shopee (vazio = automática)</label><input type="text" id="categoria_id"></div>
 <div><label>Peso padrão (kg)</label><input type="number" step="0.01" id="peso_padrao"></div>
