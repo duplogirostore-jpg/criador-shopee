@@ -228,6 +228,27 @@ def sp(path, method="GET", params=None, body=None):
     return j
 
 
+def foto_jpeg(content):
+    """Converte a foto do ML (muitas vezes webp) para JPEG que a Shopee aceita."""
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return content
+    im = Image.open(io.BytesIO(content))
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    w, h = im.size
+    if min(w, h) < 500:
+        f = 500.0 / min(w, h)
+        im = im.resize((int(w * f) + 1, int(h * f) + 1))
+    if max(im.size) > 2000:
+        im.thumbnail((2000, 2000))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=92)
+    return buf.getvalue()
+
+
 def sp_upload_image(content, name):
     path = "/api/v2/media_space/upload_image"
     ts = int(time.time())
@@ -562,6 +583,30 @@ def bling_vincular(sku, item_id, preco):
         raise RuntimeError(f"Bling vínculo respondeu {code}: {str(r)[:200]}")
 
 
+def bling_fiscal(skus):
+    """SKU normalizado -> lista de dados fiscais que faltam no produto do Bling M3 (NCM e origem)."""
+    ids = {}
+    for i in range(0, len(skus), 50):
+        code, r = bl_get("/produtos", {"codigos[]": skus[i:i + 50], "criterio": 5, "limite": 100})
+        if code != 200:
+            raise RuntimeError(f"Bling /produtos respondeu {code}: {str(r)[:160]}")
+        for it in r.get("data") or []:
+            ids[norm(it.get("codigo"))] = it["id"]
+    out = {}
+    for k, pid in ids.items():
+        code, r = bl_get(f"/produtos/{pid}")
+        if code != 200:
+            continue
+        t = (r.get("data") or {}).get("tributacao") or {}
+        falta = []
+        if not str(t.get("ncm") or "").strip():
+            falta.append("NCM")
+        if t.get("origem") in (None, ""):
+            falta.append("Origem")
+        out[k] = falta
+    return out
+
+
 def bling_empresa():
     """Nome da conta Bling conectada (para conferir se é a M3)."""
     code, r = bl_get("/empresas/me/dados-basicos")
@@ -769,10 +814,15 @@ def enviar_um(sku, s):
     if dry_run_on():
         ids = [f"(simulação) foto {i + 1}" for i in range(min(9, len(d["fotos"])))]
     else:
-        ids = []
+        ids, falhas_foto = [], []
         for i, url in enumerate(d["fotos"][:9]):
-            img = requests.get(url, timeout=60).content
-            ids.append(sp_upload_image(img, f"{sku}-{i}.jpg"))
+            try:
+                img = foto_jpeg(requests.get(url, timeout=60).content)
+                ids.append(sp_upload_image(img, f"{sku}-{i}.jpg"))
+            except Exception as e:
+                falhas_foto.append(str(e))
+        if not ids:
+            raise RuntimeError("nenhuma foto aceita pela Shopee: " + (falhas_foto[0] if falhas_foto else "sem fotos"))
     body = {
         "original_price": d["preco"], "description": texto, "item_name": d["titulo"][:120],
         "item_status": "NORMAL", "item_sku": d["sku"], "condition": "NEW", "category_id": cat,
@@ -879,6 +929,34 @@ def ml_vendas_30d():
     return vend
 
 
+ML_FISC = {"erro": ""}
+
+
+def _tem_ncm(o):
+    if isinstance(o, dict):
+        if str(o.get("ncm") or "").strip():
+            return True
+        return any(_tem_ncm(v) for v in o.values())
+    if isinstance(o, list):
+        return any(_tem_ncm(v) for v in o)
+    return False
+
+
+def ml_fiscal_ok(mlb, sku):
+    """True se o ML já tem NCM cadastrado (por anúncio ou por SKU); False se não tem; None se a consulta falhou."""
+    erro = None
+    for path in (f"/items/{mlb}/fiscal_information/detail", f"/items/fiscal_information/{sku}"):
+        code, r = ml_get(path)
+        if code == 200 and _tem_ncm(r):
+            return True
+        if code not in (200, 404):
+            erro = f"{code} {str(r)[:120]}"
+    if erro:
+        ML_FISC["erro"] = erro
+        return None
+    return False
+
+
 def job_full():
     """Vendas 30 dias x saldo no Full x meta de cobertura x saldo virtual do Bling M3, por SKU."""
     s = settings()
@@ -949,7 +1027,23 @@ def job_full():
                        "mlb": max(g["mlbs"], key=lambda m: vend.get(m, 0)).replace("MLB", ""),
                        "vendas": g["vendas"], "full": g["full"], "alvo": alvo, "sug": sug, "bl": bl,
                        "det": " · ".join(f"{c}: {int(v) if v is not None else '?'}" for c, v in vals),
-                       "status": st, "manual": g["manual"]})
+                       "status": st, "manual": g["manual"],
+                       "cs": {c: (int(v) if v is not None else None) for c, v in vals}})
+    jlog("Conferindo dados fiscais no Mercado Livre...")
+    ML_FISC["erro"] = ""
+    n_ok = n_falta = 0
+    for l in linhas:
+        if l["sug"] <= 0:
+            continue
+        ok = ml_fiscal_ok("MLB" + l["mlb"], l["sku"])
+        l["fiscal"] = [] if ok is True else (["Cadastrar no ML"] if ok is False else ["Consulta falhou"])
+        n_ok += ok is True
+        n_falta += ok is False
+    jlog(f"Dados fiscais no ML: {n_ok} com NCM, {n_falta} sem cadastro")
+    if ML_FISC["erro"]:
+        jlog(f"Consulta fiscal no ML: {ML_FISC['erro']}")
+    if n_ok == 0 and n_falta > 3:
+        jlog("Aviso: nenhum item voltou com NCM. Se isso não bate com a realidade, a consulta pode não estar disponível para a sua conta")
     linhas.sort(key=lambda x: (-x["sug"], x["sku"]))
     kv_set("full_snap", {"quando": now(), "linhas": linhas})
     jlog(f"Análise do Full concluída: {len(linhas)} SKUs")
@@ -1134,13 +1228,39 @@ def api_sync():
 def api_full():
     snap = kv_get("full_snap", {}) or {}
     return jsonify({"quando": snap.get("quando"), "linhas": snap.get("linhas", []),
-                    "manual": kv_get("full_manual", []) or [], "dias": settings().get("dias_cobertura")})
+                    "manual": kv_get("full_manual", []) or [], "pedidos": kv_get("full_pedidos", []) or [], "dias": settings().get("dias_cobertura")})
 
 
 @app.route("/api/full/run", methods=["POST"])
 def api_full_run():
     if not start_job("full", job_full):
         return jsonify({"erro": "A análise do Full já está em andamento"}), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/api/full/pedido", methods=["POST"])
+def api_full_pedido():
+    j = request.get_json(force=True) or {}
+    itens = {}
+    for k, v in (j.get("itens") or {}).items():
+        try:
+            if int(v) > 0:
+                itens[str(k)] = int(v)
+        except Exception:
+            pass
+    if not itens:
+        return jsonify({"erro": "Nenhum item com quantidade para enviar"}), 400
+    ped = kv_get("full_pedidos", []) or []
+    nome = str(j.get("nome") or "").strip() or f"Pedido {len(ped) + 1:02d}"
+    ped.append({"nome": nome, "data": str(j.get("data") or ""), "criado": now(), "itens": itens, "total": sum(itens.values())})
+    kv_set("full_pedidos", ped)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/full/pedido/excluir", methods=["POST"])
+def api_full_pedido_excluir():
+    nome = str((request.get_json(force=True) or {}).get("nome", ""))
+    kv_set("full_pedidos", [p for p in (kv_get("full_pedidos", []) or []) if p.get("nome") != nome])
     return jsonify({"ok": True})
 
 
@@ -1267,9 +1387,11 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="row" style="margin-top:8px"><button onclick="saveManual()">Salvar lista e atualizar</button><span class="mut">Meta de cobertura: <b id="fdias"></b> dias (muda em Regras de preço).</span></div>
 <div class="row" style="margin-top:10px"><label style="margin:0">Enviar só o que vendeu pelo menos</label><input type="number" id="fmin" min="0" value="0" style="width:90px" onchange="setMin()"><span class="mut">unidades em 30 dias. MLBs extras ficam fora desse filtro.</span></div></div>
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Reposição por SKU</h2>
-<select id="ffiltro" onchange="drawFull()" style="width:auto"><option value="">Todos</option><option value="enviar">A enviar</option><option value="sem">Sem estoque no Bling M3</option><option value="coberto">Cobertos</option></select>
-<button onclick="baixarCsv()">Baixar CSV</button><span class="tag" id="fcont"></span></div>
-<div class="tw"><table><thead><tr><th>SKU</th><th>Título</th><th>MLBs</th><th class="n">Vendas 30d</th><th class="n">Saldo Full</th><th class="n">Meta</th><th class="n">Sugerido</th><th class="n">Bling M3</th><th class="n">Enviar</th><th>Situação</th></tr></thead><tbody id="ftb"></tbody></table></div></div>
+<select id="ffiltro" onchange="drawFull()" style="width:auto"><option value="">Todos</option><option value="enviar">A enviar</option><option value="fiscal">Sem dados fiscais</option><option value="sem">Sem estoque no Bling M3</option><option value="coberto">Cobertos</option></select>
+<button onclick="baixarCsv()">Baixar envio</button><button onclick="baixarCompra()">Baixar compra</button><button onclick="baixarFiscal()">Pendências fiscais</button><span class="tag" id="fcont"></span></div>
+<div class="tw"><table><thead><tr><th>SKU</th><th>Título</th><th>MLBs</th><th class="n">Vendas 30d</th><th class="n">Último pedido</th><th class="n">Saldo Full</th><th class="n">Meta</th><th class="n">Sugerido</th><th class="n">Bling M3</th><th class="n">Enviar</th><th>Situação</th><th>Dados fiscais</th></tr></thead><tbody id="ftb"></tbody></table></div></div>
+<div class="card"><h2>Finalizar pedido</h2><div class="row"><input type="text" id="fped_nome" placeholder="Nome (ex.: Pedido 01)" style="width:210px"><input type="date" id="fped_data" style="width:170px"><button class="pri" onclick="finalizarPedido()">Finalizar e salvar no histórico</button></div>
+<p class="mut">Salva as quantidades da coluna Enviar. Depois elas aparecem em Último pedido.</p><div id="fhist"></div></div>
 </section>
 
 <section id="p-conexoes" hidden><div class="card"><h2>Conexões</h2><div id="conns"></div>
@@ -1346,18 +1468,47 @@ const fenv=l=>envMap[l.sku]!==undefined?envMap[l.sku]:((l.vendas<fmin&&!l.manual
 function setMin(){fmin=Math.max(0,Math.floor(+$('fmin').value||0));localStorage.setItem('fmin',fmin);drawFull()}
 const FS={coberto:['Coberto','ok'],enviar:['Enviar','ok'],parcial:['Bling não cobre','warn'],sem_estoque:['Sem estoque no Bling','bad'],sem_bling:['Não achei no Bling','bad']};
 async function loadFull(){const r=await fetch('/api/full');F=await r.json();fq=F.quando;if(document.activeElement!==$('fmanual'))$('fmanual').value=(F.manual||[]).join('\n');drawFull()}
+const ult=l=>{const P=(F.pedidos||[]).slice().sort((a,b)=>(a.data||'').localeCompare(b.data||'')||(a.criado||'').localeCompare(b.criado||''));for(let i=P.length-1;i>=0;i--){if(P[i].itens[l.sku]!==undefined)return P[i]}return null};
+const ultCell=l=>{const u=ult(l);return u?`<td class="n" title="${esc(u.nome)} (${esc(u.data||'sem data')})">${u.itens[l.sku]}</td>`:'<td class="n mut">-</td>'};
+const fiscCell=l=>l.fiscal===undefined?'<td class="mut">-</td>':(l.fiscal.length?`<td><span class="tag bad">${esc(l.fiscal.join(', '))}</span></td>`:'<td><span class="tag ok">Ok</span></td>');
+function csvDown(nome,cab,rows){const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';const csv=[cab.join(';')].concat(rows.map(r=>r.map(q).join(';'))).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));a.download=nome;a.click()}
+const mlb1=l=>l.mlb||String(l.mlbs).split(' | ')[0];
+function baixarCompra(){
+ const m={};
+ (F?F.linhas:[]).forEach(l=>{const q=fenv(l);if(q<=0)return;
+  const sal={};Object.keys(l.cs||{}).forEach(k=>sal[k.toUpperCase()]=l.cs[k]);
+  l.sku.split('-').map(x=>x.trim().toUpperCase()).filter(x=>x&&!x.startsWith('MLB')).forEach(c=>{
+   const o=m[c]=m[c]||{q:0,usos:new Set(),bl:null};o.q+=q;o.usos.add(l.sku+' x'+q);if(o.bl==null&&sal[c]!=null)o.bl=sal[c]})});
+ const R=Object.keys(m).sort().map(c=>{const o=m[c];return [c,o.q,o.bl==null?'':o.bl,o.bl==null?o.q:Math.max(0,o.q-o.bl),[...o.usos].join(' | ')]});
+ csvDown('compra-full.csv',['SKU componente','Qtd necessaria','Saldo Bling M3','A comprar','Usado em'],R)}
+function baixarFiscal(){
+ const R=(F?F.linhas:[]).filter(l=>fenv(l)>0&&l.fiscal&&l.fiscal.length).map(l=>[mlb1(l),l.sku,l.titulo,fenv(l),l.fiscal.join(', ')]);
+ csvDown('pendencias-fiscais.csv',['MLB','SKU','Titulo','Qtd a enviar','Situacao fiscal'],R)}
+function baixarPedido(i){
+ const p=F.pedidos[i],mp={};F.linhas.forEach(l=>mp[l.sku]=mlb1(l));
+ csvDown((p.nome||'pedido').replace(/[^\w-]+/g,'_')+'.csv',['MLB','SKU','Qtd'],Object.keys(p.itens).map(s=>[mp[s]||'',s,p.itens[s]]))}
+async function excluirPedido(i){const p=F.pedidos[i];if(!confirm('Excluir '+p.nome+' do histórico?'))return;await post('/api/full/pedido/excluir',{nome:p.nome});loadFull()}
+async function finalizarPedido(){
+ const itens={};(F.linhas||[]).forEach(l=>{const q=fenv(l);if(q>0)itens[l.sku]=q});
+ const n=Object.keys(itens).length;if(!n){alert('Não há itens com quantidade para enviar.');return}
+ const pecas=Object.values(itens).reduce((a,b)=>a+b,0);
+ if(!confirm('Salvar '+n+' SKUs ('+pecas+' peças) no histórico?'))return;
+ await post('/api/full/pedido',{nome:$('fped_nome').value,data:$('fped_data').value,itens});
+ envMap={};$('fped_nome').value='';await loadFull()}
+function drawHist(){
+ $('fhist').innerHTML=(F.pedidos||[]).map((p,i)=>`<div class="conn"><span><b>${esc(p.nome)}</b> <span class="mut">${esc(p.data||'sem data')} · ${Object.keys(p.itens).length} SKUs · ${p.total} peças</span></span><span class="row"><button onclick="baixarPedido(${i})">Baixar</button><button onclick="excluirPedido(${i})">Excluir</button></span></div>`).reverse().join('')||'<span class="mut">Nenhum pedido salvo ainda.</span>'}
 function drawTiles(){
  const L=F.linhas,c=f=>L.filter(f).length,env=L.filter(l=>fenv(l)>0),pecas=env.reduce((x,l)=>x+fenv(l),0);
- $('ftiles').innerHTML=[['Peças a enviar',pecas,'ok'],['SKUs a enviar',env.length,'ok'],['Sem estoque no Bling M3',c(l=>['sem_estoque','sem_bling'].includes(l.status)),'bad'],['Já cobertos',c(l=>l.status==='coberto'),''],['SKUs analisados',L.length,'']].map(t=>`<div class="tile ${t[2]}"><span class="num">${t[1]}</span><span>${t[0]}</span></div>`).join('')}
+ $('ftiles').innerHTML=[['Peças a enviar',pecas,'ok'],['SKUs a enviar',env.length,'ok'],['Cadastrar dados fiscais no ML',env.filter(l=>l.fiscal&&l.fiscal.length).length,'bad'],['Sem estoque no Bling M3',c(l=>['sem_estoque','sem_bling'].includes(l.status)),'bad'],['Já cobertos',c(l=>l.status==='coberto'),''],['SKUs analisados',L.length,'']].map(t=>`<div class="tile ${t[2]}"><span class="num">${t[1]}</span><span>${t[0]}</span></div>`).join('')}
 function drawFull(){
  if(!F)return;
  $('fquando').textContent=F.quando?'Última análise: '+F.quando+' (UTC)':'Ainda não analisado';
  drawTiles();
  if(document.activeElement!==$('fmin'))$('fmin').value=fmin;
  const L=F.linhas;
- const fl=$('ffiltro').value,rows=L.filter(l=>!fl||(fl==='enviar'?fenv(l)>0:fl==='sem'?['sem_estoque','sem_bling'].includes(l.status):l.status==='coberto'));
- $('fcont').textContent=rows.length+' SKUs';
- $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td><td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="envMap['${esc(l.sku)}']=Math.max(0,Math.floor(+this.value||0));drawTiles()"></td><td><span class="tag ${g[1]}">${g[0]}</span></td></tr>`}).join(''):'<tr><td colspan="10" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
+ const fl=$('ffiltro').value,rows=L.filter(l=>!fl||(fl==='enviar'?fenv(l)>0:fl==='fiscal'?(fenv(l)>0&&!!l.fiscal&&l.fiscal.length>0):fl==='sem'?['sem_estoque','sem_bling'].includes(l.status):l.status==='coberto'));
+ $('fcont').textContent=rows.length+' SKUs';drawHist();
+ $('ftb').innerHTML=rows.length?rows.map(l=>{const g=FS[l.status];return `<tr><td>${esc(l.sku)}${l.manual?' <span class="tag">extra</span>':''}</td><td>${esc(l.titulo)}</td><td class="mut" style="font-size:12px">${esc(l.mlbs)}</td><td class="n">${l.vendas}</td>${ultCell(l)}<td class="n">${l.full}</td><td class="n">${l.alvo}</td><td class="n">${l.sug}</td><td class="n" title="${esc(l.det)}">${l.bl==null?'-':l.bl}</td><td class="n"><input type="number" min="0" value="${fenv(l)}" style="width:76px;padding:5px" onchange="envMap['${esc(l.sku)}']=Math.max(0,Math.floor(+this.value||0));drawTiles()"></td><td><span class="tag ${g[1]}">${g[0]}</span></td>${fiscCell(l)}</tr>`}).join(''):'<tr><td colspan="12" class="mut" style="padding:22px">Nada por aqui. Clique em Atualizar análise do Full.</td></tr>';
 }
 async function runFull(){await post('/api/full/run');load()}
 async function saveManual(){await post('/api/full/manual',{texto:$('fmanual').value});await runFull()}
