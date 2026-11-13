@@ -79,6 +79,11 @@ def _conn():
     return sqlite3.connect(os.environ.get("SQLITE_PATH", "criador.db"))
 
 
+_cver = [0]                      # sobe a cada escrita em cria_cand (invalida o cache da lista)
+_cc = {"ver": -1, "data": None}
+_kvc = {}                        # cache curto das chaves pequenas (tokens, regras)
+
+
 def run(sql, args=(), fetch=False):
     conn = _conn()
     try:
@@ -86,6 +91,8 @@ def run(sql, args=(), fetch=False):
         cur.execute(sql.replace("?", "%s") if USE_PG else sql, args)
         rows = cur.fetchall() if fetch else None
         conn.commit()
+        if not fetch and "cria_cand" in sql:
+            _cver[0] += 1
         return rows
     finally:
         conn.close()
@@ -97,13 +104,22 @@ def init_db():
 
 
 def kv_get(k, default=None):
-    rows = run("SELECT v FROM cria_kv WHERE k=?", (k,), True)
-    return json.loads(rows[0][0]) if rows else default
+    c = _kvc.get(k)
+    if c and time.time() - c[0] < 10:
+        v = c[1]
+    else:
+        rows = run("SELECT v FROM cria_kv WHERE k=?", (k,), True)
+        v = rows[0][0] if rows else None
+        _kvc[k] = (time.time(), v)
+    return json.loads(v) if v is not None else default
 
 
 def kv_set(k, v):
     run("DELETE FROM cria_kv WHERE k=?", (k,))
     run("INSERT INTO cria_kv (k, v) VALUES (?, ?)", (k, json.dumps(v)))
+    _kvc[k] = (time.time(), json.dumps(v))
+    if k == "precos_manuais":
+        _cver[0] += 1
 
 
 def settings():
@@ -1039,7 +1055,9 @@ def job_full():
     if n_ok == 0 and n_falta > 3:
         jlog("Aviso: nenhum item voltou com NCM. Se isso não bate com a realidade, a consulta pode não estar disponível para a sua conta")
     linhas.sort(key=lambda x: (-x["vendas"], x["sku"]))
-    kv_set("full_snap", {"quando": now(), "linhas": linhas})
+    quando = now()
+    kv_set("full_snap", {"quando": quando, "linhas": linhas})
+    kv_set("full_quando", quando)
     jlog(f"Análise do Full concluída: {len(linhas)} SKUs")
 
 
@@ -1116,22 +1134,51 @@ def callback(svc):
     return redirect("/")
 
 
+def _full_quando():
+    q = kv_get("full_quando")
+    if q is None:
+        q = (kv_get("full_snap", {}) or {}).get("quando")
+        if q:
+            kv_set("full_quando", q)
+    return q
+
+
+def _cands():
+    """Lista da tela. Fica em memória até algo mudar e, no Postgres, traz só os campos usados (poupa transferência)."""
+    if _cc["ver"] == _cver[0] and _cc["data"] is not None:
+        return _cc["data"]
+    ver = _cver[0]
+    pm = kv_get("precos_manuais", {}) or {}
+    f = lambda x: float(x) if x not in (None, "") else None
+    out = []
+    if USE_PG:
+        j = "data::json"
+        rows = run(f"SELECT sku, status, msg, {j}->>'titulo', {j}->>'custo', {j}->>'preco', {j}->'calc'->>'lucro', "
+                   f"{j}->>'qtd', {j}->>'estoque_bling', json_array_length({j}->'fotos'), {j}->>'link', "
+                   f"{j}->>'preco_ml', {j}->>'dif_ml' FROM cria_cand ORDER BY status, sku", (), True)
+        for sku, st, msg, tit, custo, preco, lucro, qtd, eb, nf, link, pml, dif in rows:
+            out.append({"sku": sku, "titulo": tit, "custo": f(custo), "preco": f(preco), "lucro": f(lucro),
+                        "qtd": estoque_inicial({"estoque_bling": f(eb), "qtd": int(float(qtd or 0))}),
+                        "fotos": int(nf or 0), "status": st, "msg": msg, "link": link,
+                        "preco_ml": f(pml), "dif": f(dif), "preco_manual": sku in pm})
+    else:
+        for sku, data, st, msg in run("SELECT sku, data, status, msg FROM cria_cand ORDER BY status, sku", (), True):
+            d = json.loads(data)
+            out.append({"sku": sku, "titulo": d.get("titulo"), "custo": d.get("custo"), "preco": d.get("preco"),
+                        "lucro": (d.get("calc") or {}).get("lucro"), "qtd": estoque_inicial(d),
+                        "fotos": len(d.get("fotos") or []), "status": st, "msg": msg, "link": d.get("link"),
+                        "preco_ml": d.get("preco_ml"), "dif": d.get("dif_ml"), "preco_manual": sku in pm})
+    _cc.update(ver=ver, data=out)
+    return out
+
+
 @app.route("/api/state")
 def api_state():
-    rows = run("SELECT sku, data, status, msg FROM cria_cand ORDER BY status, sku", (), True)
-    pm_all = kv_get("precos_manuais", {}) or {}
-    cands = []
-    for sku, data, st, msg in rows:
-        d = json.loads(data)
-        cands.append({"sku": sku, "titulo": d.get("titulo"), "custo": d.get("custo"), "preco": d.get("preco"),
-                      "lucro": (d.get("calc") or {}).get("lucro"), "qtd": estoque_inicial(d),
-                      "fotos": len(d.get("fotos") or []), "status": st, "msg": msg, "link": d.get("link"),
-                      "preco_ml": d.get("preco_ml"), "dif": d.get("dif_ml"),
-                      "preco_manual": d["sku"] in pm_all})
+    cands = _cands()
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
-        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "full_quando": (kv_get("full_snap", {}) or {}).get("quando"), "cands": cands, "max_lote": MAX_LOTE})
+        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "full_quando": _full_quando(), "cands": cands, "max_lote": MAX_LOTE})
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -1466,7 +1513,7 @@ const PROB=['sem_custo','sem_foto','sem_estoque','bloqueado','erro','erro_preco'
 const match=(c,f)=>f==='acima'?acima(c):f==='problemas'?PROB.includes(c.status):(!f||c.status===f);
 function go(t){tab=t;location.hash=t;if(t==='full')loadFull();draw()}
 function setF(f){filt=f;draw()}
-async function load(){const r=await fetch('/api/state');S=await r.json();draw();}
+async function load(){lastLoad=Date.now();const r=await fetch('/api/state');S=await r.json();draw();}
 function draw(){
  if(!S)return;
  ['anuncios','full','conexoes','regras'].forEach(t=>{$('p-'+t).hidden=tab!==t;$('t-'+t).classList.toggle('on',tab===t)});
@@ -1578,7 +1625,10 @@ async function salvar(){
  const dim=$('dim_padrao').value.split(/[x,;\s]+/).filter(Boolean).map(Number);
  const j=await post('/api/settings',{lucro:$('lucro').value,promo:$('promo').value,imposto:$('imposto').value,piso:$('piso').value,alerta_acima_ml:$('alerta_acima_ml').value,dias_cobertura:$('dias_cobertura').value,bling_loja_id:$('bling_loja_id').value,prefixos:$('prefixos').value,categoria_id:$('categoria_id').value,peso_padrao:$('peso_padrao').value,dim_padrao:dim,atributos:$('atributos').value,criar_sem_estoque:$('criar_sem_estoque').checked});
  if(j.ok)load()}
-load();setInterval(load,4000);
+let lastLoad=0;
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
+setInterval(()=>{if(document.hidden||!S)return;const run=[S.job,S.job_send,S.job_sync,S.job_full].some(x=>x&&x.running);if(run||Date.now()-lastLoad>120000)load()},4000);
+load();
 </script></body></html>"""
 
 
@@ -1587,7 +1637,10 @@ def home():
     return render_template_string(PAGE)
 
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print("Banco indisponível na partida:", e)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
