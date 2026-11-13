@@ -678,7 +678,7 @@ def _new_job():
     return {"running": False, "kind": "", "msg": "", "done": 0, "total": 0, "log": []}
 
 
-JOBS = {"analisar": _new_job(), "enviar": _new_job(), "sync": _new_job(), "full": _new_job()}
+JOBS = {"analisar": _new_job(), "enviar": _new_job(), "sync": _new_job(), "full": _new_job(), "conf": _new_job()}
 JOB_LOCK = threading.Lock()
 _tl = threading.local()
 
@@ -1061,6 +1061,87 @@ def job_full():
     jlog(f"Análise do Full concluída: {len(linhas)} SKUs")
 
 
+def shopee_itens(prefixos):
+    """Anúncios da Shopee (sem variações) cujo SKU começa com o prefixo."""
+    ids = []
+    for st in ("NORMAL", "UNLIST", "REVIEWING"):
+        off = 0
+        while True:
+            r = sp("/api/v2/product/get_item_list", params={"offset": off, "page_size": 100, "item_status": st})
+            rr = r.get("response") or {}
+            ids += [i["item_id"] for i in rr.get("item", [])]
+            if rr.get("has_next_page"):
+                off = rr["next_offset"]
+            else:
+                break
+    pref = [norm(x) for x in re.split(r"[,;\s]+", prefixos or "") if x.strip()]
+    out = []
+    for i in range(0, len(ids), 50):
+        r = sp("/api/v2/product/get_item_base_info", params={"item_id_list": ",".join(map(str, ids[i:i + 50]))})
+        for it in (r.get("response") or {}).get("item_list", []):
+            sku = it.get("item_sku") or ""
+            if not sku or it.get("has_model"):
+                continue
+            if pref and not any(norm(sku).startswith(x) for x in pref):
+                continue
+            pi = (it.get("price_info") or [{}])[0]
+            out.append({"sku": sku, "item_id": it["item_id"], "nome": it.get("item_name", ""),
+                        "preco": pi.get("original_price") or pi.get("current_price") or 0})
+    return out
+
+
+def job_conferir(corrigir):
+    """Compara os anúncios da Shopee com o vínculo da loja Shopee no Bling M3. Só grava se corrigir=True."""
+    s = settings()
+    loja = bling_loja_id()
+    itens = shopee_itens(s["prefixos"])
+    jlog(f"{len(itens)} anúncios da Shopee com o prefixo; conferindo no Bling M3...")
+    ids = {}
+    for i in range(0, len(itens), 50):
+        code, r = bl_get("/produtos", {"codigos[]": [x["sku"] for x in itens[i:i + 50]], "criterio": 5, "limite": 100})
+        if code != 200:
+            raise RuntimeError(f"Bling /produtos respondeu {code}: {str(r)[:160]}")
+        for it in r.get("data") or []:
+            ids[norm(it.get("codigo"))] = it["id"]
+    J()["total"] = len(itens)
+    cont, lista = {}, []
+    for x in itens:
+        J()["done"] += 1
+        pid = ids.get(norm(x["sku"]))
+        if not pid:
+            st = "sem_produto"
+        else:
+            code, r = bl_get("/produtos/lojas", {"idProduto": pid})
+            links = [l for l in ((r.get("data") or []) if code == 200 else [])
+                     if int((l.get("loja") or {}).get("id") or 0) == loja]
+            if code != 200:
+                st = "erro"
+            elif any(str(l.get("codigo")) == str(x["item_id"]) for l in links):
+                st = "ok"
+            elif links:
+                st = "outro_id"
+            else:
+                st = "sem_vinculo"
+        if corrigir and st == "sem_vinculo":
+            if dry_run_on():
+                st = "simulacao"
+            else:
+                try:
+                    bling_vincular(x["sku"], x["item_id"], x["preco"])
+                    set_cand(x["sku"], {"sku": x["sku"], "titulo": x["nome"], "shopee_item_id": x["item_id"],
+                                        "preco": x["preco"], "bling_vinculado": True}, "criado",
+                             f"item {x['item_id']}; vinculado no Bling (conferência)")
+                    st = "corrigido"
+                except Exception as e:
+                    st = "falhou: " + str(e)[:90]
+        cont[st.split(":")[0]] = cont.get(st.split(":")[0], 0) + 1
+        if st != "ok":
+            lista.append(dict(x, status=st))
+    resumo = f"{len(itens)} anúncios: " + ", ".join(f"{v} {k}" for k, v in sorted(cont.items()))
+    kv_set("conf_result", {"quando": now(), "resumo": resumo, "itens": lista[:400]})
+    jlog("Conferência concluída: " + resumo)
+
+
 def job_enviar(skus):
     s = settings()
     J()["total"] = len(skus)
@@ -1178,7 +1259,7 @@ def api_state():
     return jsonify({
         "conn": {"shopee": bool(kv_get("shopee_tok")), "ml": bool(kv_get("ml_tok")), "bling": bool(kv_get("bling_tok"))},
         "cfg_ok": {"shopee": bool(SHOPEE_PID and SHOPEE_KEY), "ml": bool(ML_ID and ML_SECRET), "bling": bool(BLING_ID and BLING_SECRET)},
-        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "full_quando": _full_quando(), "cands": cands, "max_lote": MAX_LOTE})
+        "settings": settings(), "dry": dry_run_on(), "job": JOBS["analisar"], "job_send": JOBS["enviar"], "job_sync": JOBS["sync"], "job_full": JOBS["full"], "job_conf": JOBS["conf"], "full_quando": _full_quando(), "cands": cands, "max_lote": MAX_LOTE})
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -1373,6 +1454,19 @@ def api_bling_vinculo():
     return jsonify(out)
 
 
+@app.route("/api/conf")
+def api_conf():
+    return jsonify(kv_get("conf_result", {}) or {})
+
+
+@app.route("/api/conf/run", methods=["POST"])
+def api_conf_run():
+    corrigir = bool((request.get_json(silent=True) or {}).get("corrigir"))
+    if not start_job("conf", job_conferir, corrigir):
+        return jsonify({"erro": "A conferência já está em andamento"}), 409
+    return jsonify({"ok": True})
+
+
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
     if not start_job("analisar", job_analisar):
@@ -1455,6 +1549,7 @@ input[type=text],input[type=number],textarea,select{width:100%;font:inherit;padd
 <div class="card"><div class="row"><button class="pri" id="bAn" onclick="analisar()">Analisar Mercado Livre e Shopee</button><button id="bSync" onclick="sync()">Sincronizar estoque com o Bling M3</button><span id="amsg" class="mut"></span><span id="ymsg" class="mut"></span></div>
 <div class="bar"><i id="aprog"></i></div>
 <details><summary class="mut" style="cursor:pointer">Ver detalhes da análise</summary><div id="alog"></div></details></div>
+<div class="card"><div class="row"><button id="bConf" onclick="runConf(false)">Conferir vínculos Shopee e Bling</button><button id="bConfFix" onclick="runConf(true)">Corrigir os sem vínculo</button><span id="cmsg" class="mut"></span></div><div id="ctab"></div></div>
 <details class="card"><summary class="mut" style="cursor:pointer">Ver detalhes do envio</summary><div id="slog"></div></details>
 <div class="card"><div class="row" style="margin-bottom:12px"><h2 style="margin:0;margin-right:auto">Anúncios para criar</h2>
 <select id="filtro" onchange="setF(this.value)" style="width:auto"><option value="pendente">Prontos</option><option value="acima">Acima do ML</option><option value="problemas">Com pendência</option><option value="simulado">Simulados</option><option value="criado">Criados</option><option value="">Todos</option></select>
@@ -1535,6 +1630,8 @@ function draw(){
  $('slog').textContent=s.log.join('\n');const y=S.job_sync;$('ymsg').textContent=y.running?('Sincronizando '+y.done+' de '+y.total+'...'):(y.log.length?y.msg:'');$('bSync').disabled=y.running;
  const fj=S.job_full;$('fmsg').textContent=fj.running?fj.msg:(fj.log.length?fj.msg:'');$('fprog').style.width=(fj.total?Math.round(fj.done/fj.total*100):0)+'%';$('bFull').disabled=fj.running;$('fdias').textContent=S.settings.dias_cobertura;
  if(tab==='full'&&S.full_quando!==fq)loadFull();
+ const cj=S.job_conf;$('cmsg').textContent=cj.running?('Conferindo '+cj.done+' de '+cj.total+'...'):(cj.log.length?cj.msg:'');$('bConf').disabled=$('bConfFix').disabled=cj.running;
+ if(cprev&&!cj.running)loadConf();cprev=cj.running;if(C===null){C={};loadConf()}
  $('bAn').disabled=a.running;
  const ordf={sku:(a,b)=>a.sku.localeCompare(b.sku),estoque:(a,b)=>(b.qtd||0)-(a.qtd||0),lucro:(a,b)=>(b.lucro||0)-(a.lucro||0),dif:(a,b)=>(a.dif==null)-(b.dif==null)||(a.dif||0)-(b.dif||0)};
  const all=S.cands.filter(c=>match(c,filt)).sort(ordf[$('ord').value]||ordf.sku),rows=all.slice(0,500);visAn=all;
@@ -1548,6 +1645,13 @@ function tog(s,on){if(on){if(sel.size>=S.max_lote){alert('O máximo é '+S.max_l
 function sel50(){sel.clear();visAn.filter(c=>c.status==='pendente'&&!acima(c)).slice(0,S.max_lote).forEach(c=>sel.add(c.sku));draw()}
 function selNone(){sel.clear();draw()}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)alert(j.erro||'Erro');return j}
+let C=null,cprev=false;
+const CS={sem_vinculo:['Sem vínculo no Bling','bad'],outro_id:['Vínculo com outro ID (revisar)','warn'],sem_produto:['SKU não achado no Bling','bad'],erro:['Erro ao consultar','bad'],corrigido:['Corrigido','ok'],simulacao:['Corrigiria (simulação)','warn']};
+async function loadConf(){const r=await fetch('/api/conf');C=await r.json();drawConf()}
+function drawConf(){
+ if(!C||!C.itens){$('ctab').innerHTML='';return}
+ $('ctab').innerHTML=`<p class="mut">${esc(C.resumo)} <span class="mut">(${esc(C.quando)} UTC)</span></p>`+(C.itens.length?`<div class="tw" style="max-height:260px"><table><thead><tr><th>SKU</th><th>ID do item</th><th class="n">Preço</th><th>Situação</th></tr></thead><tbody>${C.itens.map(x=>{const g=CS[x.status]||[x.status,'bad'];return `<tr><td>${esc(x.sku)}</td><td>${esc(x.item_id)}</td><td class="n">${brl(x.preco)}</td><td><span class="tag ${g[1]}">${esc(g[0])}</span></td></tr>`}).join('')}</tbody></table></div>`:'<p class="mut">Tudo vinculado.</p>')}
+async function runConf(fix){if(fix&&!confirm('Gravar no Bling o ID do anúncio da Shopee nos produtos que estão sem vínculo?'))return;await post('/api/conf/run',{corrigir:fix});load()}
 let F=null,fq=null,envMap={},fmin=Number(localStorage.getItem('fmin')||0);
 let visRows=[],visAn=[];
 const aj=sku=>{F.ajustes=F.ajustes||{};return F.ajustes[sku]=F.ajustes[sku]||{}};
@@ -1627,7 +1731,7 @@ async function salvar(){
  if(j.ok)load()}
 let lastLoad=0;
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
-setInterval(()=>{if(document.hidden||!S)return;const run=[S.job,S.job_send,S.job_sync,S.job_full].some(x=>x&&x.running);if(run||Date.now()-lastLoad>120000)load()},4000);
+setInterval(()=>{if(document.hidden||!S)return;const run=[S.job,S.job_send,S.job_sync,S.job_full,S.job_conf].some(x=>x&&x.running);if(run||Date.now()-lastLoad>120000)load()},4000);
 load();
 </script></body></html>"""
 
